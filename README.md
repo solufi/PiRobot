@@ -72,6 +72,9 @@ curl -u "$PICAR_USER:$PICAR_PASS" -X DELETE \
 Depuis l’interface, ouvrez **Paramètres**, saisissez un prénom puis cliquez sur
 **ENREGISTRER PAR CAMÉRA**. Le robot prend jusqu’à sept captures et valide au moins cinq
 captures stables avant d’enregistrer l’empreinte moyenne.
+Le curseur **Seuil de reconnaissance** permet d’ajuster la tolérance sans SSH; une valeur
+plus basse est plus stricte, une valeur plus haute accepte davantage de variations mais
+augmente le risque de confusion.
 
 Quand des profils existent, le suivi utilise uniquement un visage reconnu; sinon il refuse
 le suivi. Sans modèle SFace, le robot conserve son fonctionnement précédent.

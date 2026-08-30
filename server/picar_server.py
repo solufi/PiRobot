@@ -168,6 +168,7 @@ if face_detector is None:
         "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
     )
 face_identity = FaceIdentity()
+settings["face_threshold"] = face_identity.threshold
 
 # Full-body person detector (HOG + linear SVM, built into OpenCV).
 # Heavier than YuNet (~50ms on Pi 5 at 320x240) so we run it less often.
@@ -1369,6 +1370,8 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
          style="width:60%;padding:6px;border-radius:6px;border:none;background:#222;color:#eee;">
   <button class="small-btn" id="faceCapture">ENREGISTRER PAR CAMÉRA</button>
   <span id="faceCaptureStatus" style="font-size:12px;"></span>
+  <label>Seuil de reconnaissance: <span class="value" id="faceThresholdValue">0.363</span></label>
+  <input id="faceThreshold" type="range" min="0.200" max="0.800" step="0.001" value="0.363">
   <br><br>
   <button class="small-btn" data-once="center">CENTER</button>
   <button class="small-btn" data-once="cam_center">CAM CENTER</button>
@@ -1434,6 +1437,10 @@ function applyState(s){
   if (s.settings) {
     document.getElementById("faceStatus").innerText = s.settings.last_face || "---";
     document.getElementById("recognizedStatus").innerText = s.settings.recognized_face || "---";
+    if (typeof s.settings.face_threshold === "number") {
+      document.getElementById("faceThreshold").value = s.settings.face_threshold;
+      document.getElementById("faceThresholdValue").innerText = s.settings.face_threshold.toFixed(3);
+    }
     document.getElementById("trackStatus").innerText = s.settings.tracking ? "ON" : "OFF";
     document.getElementById("followStatus").innerText = s.settings.follow_me ? "ON" : "OFF";
     document.getElementById("listenStatus").innerText = s.settings.listening ? "ON" : "OFF";
@@ -1704,6 +1711,14 @@ document.getElementById("faceDelete").addEventListener("click", async () => {
   const data = await response.json();
   status.innerText = data.ok ? "Profil supprimé" : "Profil introuvable";
 });
+document.getElementById("faceThreshold").addEventListener("change", async (event) => {
+  const threshold = parseFloat(event.target.value);
+  document.getElementById("faceThresholdValue").innerText = threshold.toFixed(3);
+  await fetch("/face_settings", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({threshold:threshold})
+  });
+});
 
 function press(action){ wsSend({type:"cmd", action: action}); }
 function release(action){ wsSend({type:"cmd", action: "release_" + action}); }
@@ -1859,6 +1874,21 @@ def face_profiles_capture_route():
         "profiles": face_identity.profiles(),
         "captures": len(features),
     })
+
+
+@app.route("/face_settings", methods=["GET", "POST"])
+@requires_auth
+def face_settings_route():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        try:
+            threshold = face_identity.set_threshold(data.get("threshold"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "seuil invalide"}), 400
+        with state_lock:
+            settings["face_threshold"] = threshold
+        return jsonify({"ok": True, "threshold": threshold})
+    return jsonify({"threshold": face_identity.threshold})
 
 
 @app.route("/settings", methods=["POST"])

@@ -20,7 +20,8 @@ class FaceIdentity:
             "PICAR_FACE_PROFILES",
             "/home/solufi/models/face_profiles.json",
         ))
-        self.threshold = float(os.environ.get("PICAR_FACE_THRESHOLD", "0.363"))
+        self.settings_path = self.profiles_path.with_name("face_settings.json")
+        self.threshold = self._load_threshold()
         self.lock = threading.RLock()
         self.recognizer = None
         if os.path.isfile(self.model_path) and hasattr(cv2, "FaceRecognizerSF_create"):
@@ -44,9 +45,29 @@ class FaceIdentity:
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return {}
 
+    def _load_threshold(self) -> float:
+        default = float(os.environ.get("PICAR_FACE_THRESHOLD", "0.363"))
+        try:
+            value = json.loads(self.settings_path.read_text()).get("threshold")
+            return max(0.2, min(0.8, float(value)))
+        except (FileNotFoundError, AttributeError, TypeError, ValueError,
+                json.JSONDecodeError, OSError):
+            return max(0.2, min(0.8, default))
+
     def profiles(self) -> list[str]:
         with self.lock:
             return sorted(self._read())
+
+    def set_threshold(self, value: float) -> float:
+        threshold = max(0.2, min(0.8, float(value)))
+        with self.lock:
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            temp = self.settings_path.with_suffix(".tmp")
+            temp.write_text(json.dumps({"threshold": threshold}))
+            temp.replace(self.settings_path)
+            self.settings_path.chmod(0o600)
+            self.threshold = threshold
+        return threshold
 
     def _write(self, profiles: dict[str, list[float]]) -> None:
         self.profiles_path.parent.mkdir(parents=True, exist_ok=True)
