@@ -31,6 +31,7 @@ Le script copie l'app, met à jour l'unit systemd, supprime l'ancien drop-in, re
 | `PICAR_PASS`    | Mot de passe basic-auth                               |
 | `PICAR_PORT`    | Port d'écoute (défaut 5000)                           |
 | `PICAR_CONTROL_TIMEOUT` | Arrêt automatique si la commande manuelle expire |
+| `PICAR_VOLUME_BOOST` | Gain logiciel TTS (100 normal, jusqu'à 300, risque de saturation) |
 | `OPENAI_API_KEY`| Phase 3 — intégration ChatGPT                         |
 
 Recharge: `sudo systemctl restart picar.service`.

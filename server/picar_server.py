@@ -40,6 +40,13 @@ AUTH_PASS = os.environ.get("PICAR_PASS")
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
+try:
+    DEFAULT_VOLUME_BOOST = max(
+        0, min(300, int(os.environ.get("PICAR_VOLUME_BOOST", "150")))
+    )
+except ValueError:
+    DEFAULT_VOLUME_BOOST = 150
+
 settings = {
     "speed": 70,
     "turn_angle": 30,
@@ -50,7 +57,7 @@ settings = {
     "last_face": "OFF",
     "volume": 100,
     # Software gain boost applied on top of amixer (100 = unity, 200 = +6dB, 300 = +9.5dB)
-    "volume_boost": 150,
+    "volume_boost": DEFAULT_VOLUME_BOOST,
     "cam_pan_cali": 0.0,
     "cam_tilt_cali": 0.0,
     "dir_cali": 0.0,
@@ -1935,6 +1942,7 @@ def ws_endpoint(ws):
                     last_manual_command = time.monotonic()
     finally:
         stop_evt.set()
+        stop_all()
         log.info("ws client disconnected")
 
 
