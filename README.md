@@ -38,7 +38,9 @@ Recharge: `sudo systemctl restart picar.service`.
 
 - **Phase 1 — ✅** Logging, basic-auth, threaded Flask, healthz, systemd durci, drop-in fusionné
 - **Phase 2** — Camera thread découplé + Flask-SocketIO pour les contrôles (latence ↓)
-- **Phase 3** — Endpoint `/chat` ChatGPT (intent → actions), STT/TTS
+- **Phase 3** — Endpoint `/chat` ChatGPT (intent → actions), STT/TTS, séquences vocales courtes et interrompables
+
+Les séquences vocales passent par `run_task` : au plus 8 étapes, 12 secondes au total et 1,5 seconde par mouvement. Une commande `stop` ou un obstacle/falaise interrompt la séquence.
 
 ## Diagnostic rapide
 

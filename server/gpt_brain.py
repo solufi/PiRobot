@@ -1,7 +1,7 @@
 """GPT brain for PiCar-X.
 
 Exposes a `chat(message)` function that:
-  - sends the user message to OpenAI with tool definitions for robot actions
+- sends the user message to OpenAI with tool definitions for robot actions
   - executes returned tool calls via callbacks registered by the main server
   - returns a final spoken reply (text) + the list of executed actions
 
@@ -43,6 +43,7 @@ Si une demande mélange les deux (« avance et raconte-moi une blague »), appel
 pour l'action puis ajoute la réponse parlée.
 
 Mapping des intentions courantes vers les tools :
+- "fais cette séquence" -> run_task(steps=[...]) avec au plus 8 étapes courtes
 - "avance", "va devant", "tout droit"  -> drive(direction="forward", duration_ms=600)
 - "recule", "va derrière"               -> drive(direction="backward", duration_ms=600)
 - "tourne à gauche", "gauche"          -> drive(direction="left", duration_ms=600)
@@ -61,6 +62,7 @@ Mapping des intentions courantes vers les tools :
 
 Règles de sécurité STRICTES :
 - Chaque drive ne dure JAMAIS plus de 1500 ms.
+- Pour une séquence, chaque étape est courte et la durée totale ne dépasse jamais 12 secondes.
 - Vitesse par défaut entre 30 et 80 ; au-dessus seulement si on dit "fonce", "à fond".
 - En cas de doute -> stop_all().
 
@@ -79,6 +81,29 @@ TOOLS = [
                 "duration_ms": {"type": "integer", "minimum": 100, "maximum": 1500, "default": 600},
             },
             "required": ["direction"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "run_task",
+        "description": "Exécute une séquence courte et prévisible de déplacements. Maximum 8 étapes et 12 secondes au total; chaque déplacement doit rester inférieur ou égal à 1500 ms.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "action": {"type": "string", "enum": ["drive", "wait"]},
+                            "direction": {"type": "string", "enum": ["forward", "backward", "left", "right", "stop"]},
+                            "duration_ms": {"type": "integer", "minimum": 100, "maximum": 1500},
+                        },
+                        "required": ["action"],
+                    },
+                },
+            },
+            "required": ["steps"],
         },
     }},
     {"type": "function", "function": {

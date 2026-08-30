@@ -111,7 +111,10 @@ control = {
     "right": False,
 }
 
-state_lock = threading.Lock()
+state_lock = threading.RLock()
+motor_lock = threading.RLock()
+drive_cancel = threading.Event()
+task_lock = threading.Lock()
 frame_lock = threading.Lock()
 latest_frame = None         # numpy RGB array (raw)
 latest_overlay = None       # numpy RGB array with face box drawn (when tracking on)
@@ -172,26 +175,30 @@ def clamp(v, mi, ma):
 
 
 def update_movement():
-    angle = 0
-    if control["left"]:
-        angle -= settings["turn_angle"]
-    if control["right"]:
-        angle += settings["turn_angle"]
-    px.set_dir_servo_angle(angle)
+    with motor_lock:
+        angle = 0
+        if control["left"]:
+            angle -= settings["turn_angle"]
+        if control["right"]:
+            angle += settings["turn_angle"]
+        px.set_dir_servo_angle(angle)
 
-    if control["forward"] and not control["backward"]:
-        px.forward(settings["speed"])
-    elif control["backward"] and not control["forward"]:
-        px.backward(settings["speed"])
-    else:
-        px.stop()
+        if control["forward"] and not control["backward"]:
+            px.forward(settings["speed"])
+        elif control["backward"] and not control["forward"]:
+            px.backward(settings["speed"])
+        else:
+            px.stop()
 
 
 def stop_all():
-    for k in control:
-        control[k] = False
-    px.stop()
-    px.set_dir_servo_angle(0)
+    drive_cancel.set()
+    with state_lock:
+        for k in control:
+            control[k] = False
+    with motor_lock:
+        px.stop()
+        px.set_dir_servo_angle(0)
 
 
 def safety_blocks(direction: str) -> bool:
@@ -674,21 +681,76 @@ def act_drive(direction: str, duration_ms: int = 600):
     if direction != "stop" and safety_blocks(direction):
         stop_all()
         return
-    sp = settings["speed"]
+    with state_lock:
+        sp = settings["speed"]
+        turn_angle = settings["turn_angle"]
     if direction == "stop":
         stop_all(); return
-    if direction == "forward":
-        px.set_dir_servo_angle(0); px.forward(sp)
-    elif direction == "backward":
-        px.set_dir_servo_angle(0); px.backward(sp)
-    elif direction == "left":
-        px.set_dir_servo_angle(-settings["turn_angle"]); px.forward(sp)
-    elif direction == "right":
-        px.set_dir_servo_angle(settings["turn_angle"]); px.forward(sp)
-    else:
-        return
-    time.sleep(duration_ms / 1000.0)
-    px.stop(); px.set_dir_servo_angle(0)
+    drive_cancel.clear()
+    with motor_lock:
+        turn = 0
+        if direction == "left":
+            turn = -turn_angle
+        elif direction == "right":
+            turn = turn_angle
+        px.set_dir_servo_angle(turn)
+        if direction == "backward":
+            px.backward(sp)
+        else:
+            px.forward(sp)
+    deadline = time.monotonic() + duration_ms / 1000.0
+    while time.monotonic() < deadline and not drive_cancel.is_set():
+        if safety_blocks(direction):
+            drive_cancel.set()
+            break
+        time.sleep(0.05)
+    with motor_lock:
+        px.stop()
+        px.set_dir_servo_angle(0)
+
+
+def act_run_task(steps: list[dict]) -> dict:
+    if not isinstance(steps, list) or not 1 <= len(steps) <= 8:
+        return {"ok": False, "error": "une tâche doit contenir 1 à 8 étapes"}
+    total_ms = 0
+    with task_lock:
+        drive_cancel.clear()
+        for step in steps:
+            if not isinstance(step, dict):
+                return {"ok": False, "error": "étape invalide"}
+            action = step.get("action")
+            if action == "drive":
+                direction = step.get("direction")
+                duration_ms = step.get("duration_ms", 600)
+                if direction not in {"forward", "backward", "left", "right", "stop"}:
+                    return {"ok": False, "error": "direction invalide"}
+                try:
+                    duration_ms = max(100, min(int(duration_ms), 1500))
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "durée invalide"}
+                total_ms += duration_ms
+                if total_ms > 12000:
+                    return {"ok": False, "error": "durée totale maximale dépassée"}
+                act_drive(direction, duration_ms)
+                if direction == "stop":
+                    drive_cancel.clear()
+            elif action == "wait":
+                duration_ms = step.get("duration_ms", 100)
+                try:
+                    duration_ms = max(100, min(int(duration_ms), 1500))
+                except (TypeError, ValueError):
+                    return {"ok": False, "error": "durée invalide"}
+                total_ms += duration_ms
+                if total_ms > 12000:
+                    return {"ok": False, "error": "durée totale maximale dépassée"}
+                if drive_cancel.wait(duration_ms / 1000.0):
+                    return {"ok": False, "cancelled": True}
+            else:
+                return {"ok": False, "error": "action invalide"}
+            if drive_cancel.is_set():
+                return {"ok": False, "cancelled": True}
+        stop_all()
+    return {"ok": True, "steps": len(steps), "duration_ms": total_ms}
 
 
 def act_set_speed(speed: int):
@@ -774,6 +836,7 @@ def apply_calibration(target: str, value: float):
 
 brain = GPTBrain({
     "drive": act_drive,
+    "run_task": act_run_task,
     "set_speed": act_set_speed,
     "set_camera": act_set_camera,
     "set_follow_me": act_set_follow_me,
