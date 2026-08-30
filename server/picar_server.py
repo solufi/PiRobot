@@ -7,8 +7,7 @@ Architecture:
 - WebSocket /ws handles control events (drive, settings, camera, tracking, stop).
 - HTTP POST endpoints kept as fallback for the legacy UI.
 """
-import os, getpass, base64, functools, logging, threading, time, json, subprocess, tempfile, uuid, pathlib, math
-os.getlogin = lambda: getpass.getuser()
+import os, base64, functools, logging, threading, time, json, subprocess, tempfile, uuid, pathlib, math
 
 from flask import Flask, render_template_string, request, jsonify, Response, send_file, abort
 from flask_sock import Sock
@@ -29,6 +28,9 @@ log = logging.getLogger("picar")
 
 app = Flask(__name__)
 sock = Sock(app)
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.environ.get("PICAR_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024))
+)
 px = Picarx()
 
 AUTH_USER = os.environ.get("PICAR_USER")
@@ -76,6 +78,18 @@ TTS_DIR = pathlib.Path(tempfile.gettempdir()) / "picar_tts"
 TTS_DIR.mkdir(exist_ok=True)
 tts_play_lock = threading.Lock()
 mic_lock = threading.Lock()  # serialize arecord usage between /voice/pi and listen_loop
+
+
+def cleanup_tts_files(max_age_seconds: int = 3600):
+    cutoff = time.time() - max_age_seconds
+    for path in TTS_DIR.glob("tts_*.mp3"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("could not remove stale TTS file: %s", path)
 
 # Wake word config
 WAKE_WORD = os.environ.get("PICAR_WAKE_WORD", "jamal").lower()
@@ -178,6 +192,17 @@ def stop_all():
         control[k] = False
     px.stop()
     px.set_dir_servo_angle(0)
+
+
+def safety_blocks(direction: str) -> bool:
+    """Return whether safety sensors currently forbid a movement."""
+    with state_lock:
+        safety = settings["safety"]
+        obstacle = settings["obstacle"]
+        cliff = settings["cliff"]
+    if not safety:
+        return False
+    return cliff or (obstacle and direction in {"forward", "left", "right"})
 
 
 def camera_center():
@@ -545,19 +570,25 @@ threading.Thread(target=sensor_loop, daemon=True, name="sensor").start()
 def requires_auth(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
-        if not AUTH_USER:
+        if _request_is_authorized():
             return fn(*a, **kw)
-        h = request.headers.get("Authorization", "")
-        if h.startswith("Basic "):
-            try:
-                u, p = base64.b64decode(h[6:]).decode("utf-8", "ignore").split(":", 1)
-                if u == AUTH_USER and p == AUTH_PASS:
-                    return fn(*a, **kw)
-            except Exception:
-                pass
         return Response("Auth required", 401,
                         {"WWW-Authenticate": 'Basic realm="PiCar-X"'})
     return wrapper
+
+
+def _request_is_authorized():
+    if not AUTH_USER:
+        return True
+    h = request.headers.get("Authorization", "")
+    if h.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(h[6:], validate=True).decode("utf-8")
+            u, p = decoded.split(":", 1)
+            return u == AUTH_USER and p == AUTH_PASS
+        except Exception:
+            pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +669,11 @@ def apply_camera_settings(pan=None, tilt=None):
 # ---------------------------------------------------------------------------
 def act_drive(direction: str, duration_ms: int = 600):
     duration_ms = max(100, min(int(duration_ms), 1500))
+    if direction not in {"forward", "backward", "left", "right", "stop"}:
+        return
+    if direction != "stop" and safety_blocks(direction):
+        stop_all()
+        return
     sp = settings["speed"]
     if direction == "stop":
         stop_all(); return
@@ -1029,6 +1065,7 @@ def set_volume(percent: int) -> int:
 def tts_to_file(text: str) -> str | None:
     if not brain.enabled or not text.strip():
         return None
+    cleanup_tts_files()
     out = TTS_DIR / f"tts_{uuid.uuid4().hex}.mp3"
     log.info("TTS: creating file %s for text: %r", out, text[:50])
     try:
@@ -1523,13 +1560,14 @@ def video():
 @app.route("/status")
 @requires_auth
 def status():
-    return jsonify(settings)
+    return jsonify(state_snapshot()["settings"])
 
 
 @app.route("/tracking", methods=["POST"])
 @requires_auth
 def tracking_route():
-    settings["tracking"] = request.form.get("tracking") == "true"
+    with state_lock:
+        settings["tracking"] = request.form.get("tracking") == "true"
     return "ok"
 
 
@@ -1572,7 +1610,7 @@ def volume_route():
 def say_route():
     """Quick TTS test: synthesize text and play it on the Pi speaker."""
     data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "Bonjour, je suis le robot.").strip()
+    text = (data.get("text") or "Bonjour, je suis le robot.").strip()[:500]
     if not brain.enabled:
         return jsonify({"ok": False, "error": "OPENAI_API_KEY non configurée"}), 503
     path = tts_to_file(text)
@@ -1590,11 +1628,12 @@ def calibration_route():
         for k in ("cam_pan", "cam_tilt", "dir"):
             if k in data:
                 apply_calibration(k, data[k])
-    return jsonify({
-        "cam_pan": settings["cam_pan_cali"],
-        "cam_tilt": settings["cam_tilt_cali"],
-        "dir": settings["dir_cali"],
-    })
+    with state_lock:
+        return jsonify({
+            "cam_pan": settings["cam_pan_cali"],
+            "cam_tilt": settings["cam_tilt_cali"],
+            "dir": settings["dir_cali"],
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -1604,7 +1643,7 @@ def _process_user_message(message: str, speak_on_pi: bool) -> dict:
     """Send a user message to the brain, optionally play TTS on the Pi."""
     if not brain.enabled:
         return {"ok": False, "error": "OPENAI_API_KEY non configurée"}
-    result = brain.chat(message)
+    result = brain.chat(message[:2000])
     reply = result.get("reply", "")
     tts_path = tts_to_file(reply)
     tts_id = pathlib.Path(tts_path).name if tts_path else None
@@ -1637,7 +1676,10 @@ def voice_pi_route():
     if not brain.enabled:
         return jsonify({"ok": False, "error": "OPENAI_API_KEY non configurée"}), 503
     data = request.get_json(silent=True) or {}
-    seconds = float(data.get("seconds", PI_MIC_SECONDS))
+    try:
+        seconds = float(data.get("seconds", PI_MIC_SECONDS))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "durée invalide"}), 400
     seconds = max(1.0, min(seconds, 15.0))
     try:
         wav = record_pi_mic(seconds)
@@ -1693,6 +1735,9 @@ def tts_route(name):
 # ---------------------------------------------------------------------------
 @sock.route("/ws")
 def ws_endpoint(ws):
+    if not _request_is_authorized():
+        ws.close()
+        return
     log.info("ws client connected")
     # initial state push
     try:

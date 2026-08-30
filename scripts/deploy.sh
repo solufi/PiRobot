@@ -29,6 +29,7 @@ ssh "${HOST}" '
   sudo systemctl restart picar.service
   sleep 4
   systemctl is-active picar.service
+  curl --fail --silent --show-error --max-time 5 http://127.0.0.1:5000/healthz >/dev/null
   ss -tlnp 2>/dev/null | grep -E ":(5000|443|80) " || true
 '
 echo "==> Done. Tail logs:  ssh ${HOST} journalctl -u picar.service -f"

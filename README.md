@@ -19,7 +19,7 @@ scripts/deploy.sh             # scp + restart + healthcheck
 ./scripts/deploy.sh user@host       # autre cible
 ```
 
-Le script copie l'app, met à jour l'unit systemd, supprime l'ancien drop-in, recharge et redémarre. Il échoue immédiatement si le service ne devient pas `active`.
+Le script copie l'app, met à jour l'unit systemd, supprime l'ancien drop-in, recharge et redémarre. Il vérifie ensuite que le service est `active` et que `/healthz` répond.
 
 ## Configuration runtime
 
@@ -27,7 +27,7 @@ Le script copie l'app, met à jour l'unit systemd, supprime l'ancien drop-in, re
 
 | Variable        | Effet                                                |
 |-----------------|------------------------------------------------------|
-| `PICAR_USER`    | Active basic-auth HTTP si défini                      |
+| `PICAR_USER`    | Active basic-auth HTTP et WebSocket si défini         |
 | `PICAR_PASS`    | Mot de passe basic-auth                               |
 | `PICAR_PORT`    | Port d'écoute (défaut 5000)                           |
 | `OPENAI_API_KEY`| Phase 3 — intégration ChatGPT                         |
