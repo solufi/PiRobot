@@ -5,6 +5,7 @@ set -euo pipefail
 
 HOST="${1:-solufi@192.168.2.181}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEFAULT_VOLUME_BOOST="${PICAR_VOLUME_BOOST:-180}"
 
 echo "==> Deploying to ${HOST}"
 
@@ -23,6 +24,9 @@ ssh "${HOST}" '
   sudo rm -rf /etc/systemd/system/picar.service.d
   # Ensure /etc/picar.env exists (empty is fine — auth disabled)
   [ -f /etc/picar.env ] || (echo "# PiCar-X env (see .env.example)" | sudo tee /etc/picar.env >/dev/null && sudo chmod 600 /etc/picar.env)
+  if ! sudo grep -q "^PICAR_VOLUME_BOOST=" /etc/picar.env; then
+    echo "PICAR_VOLUME_BOOST='"${DEFAULT_VOLUME_BOOST}"'" | sudo tee -a /etc/picar.env >/dev/null
+  fi
   sudo systemctl daemon-reload
   sudo systemctl reset-failed picar.service || true
   sudo systemctl enable picar.service
