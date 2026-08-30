@@ -14,8 +14,10 @@ from flask_sock import Sock
 from picarx import Picarx
 from picamera2 import Picamera2
 import cv2
+import numpy as np
 
 from gpt_brain import GPTBrain
+from face_identity import FaceIdentity
 from task_policy import validate_steps
 
 try:
@@ -71,6 +73,7 @@ settings = {
     # Continuous listening with wake word
     "listening": False,
     "last_heard": "",
+    "recognized_face": "",
 }
 
 # Safety thresholds
@@ -164,6 +167,7 @@ if face_detector is None:
     face_cascade = cv2.CascadeClassifier(
         "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
     )
+face_identity = FaceIdentity()
 
 # Full-body person detector (HOG + linear SVM, built into OpenCV).
 # Heavier than YuNet (~50ms on Pi 5 at 320x240) so we run it less often.
@@ -322,6 +326,25 @@ def detect_faces(frame_rgb):
     return [(int(x), int(y), int(w), int(h), 1.0) for (x, y, w, h) in faces]
 
 
+def detect_face_details(frame_rgb):
+    if face_detector is None:
+        return []
+    small = cv2.resize(frame_rgb, DETECT_SIZE)
+    bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
+    _, faces = face_detector.detect(bgr)
+    if faces is None:
+        return []
+    details = []
+    for face in faces:
+        scaled = face.astype(float).copy()
+        scaled[0:4] *= (DETECT_SCALE_X, DETECT_SCALE_Y,
+                        DETECT_SCALE_X, DETECT_SCALE_Y)
+        scaled[4:14:2] *= DETECT_SCALE_X
+        scaled[5:14:2] *= DETECT_SCALE_Y
+        details.append(tuple(scaled.tolist()))
+    return details
+
+
 def detect_persons(frame_rgb):
     """Return list of (x,y,w,h,score) of full-body persons in CAM_SIZE coords."""
     if yolo_detector is not None:
@@ -423,12 +446,33 @@ def tracking_loop():
             faces = detect_faces(frame)
             detect_ms = (time.time() - t0) * 1000.0
             detect_count += 1
+            recognized_name = None
+            profile_names = face_identity.profiles() if face_identity.available else []
+            if profile_names:
+                details = detect_face_details(frame)
+                if details:
+                    candidate = max(details, key=lambda face: face[2] * face[3])
+                    feature = face_identity.feature(frame, candidate)
+                    if feature is not None:
+                        recognized_name = face_identity.identify(feature)
+                with state_lock:
+                    settings["recognized_face"] = recognized_name or "inconnu"
+                if recognized_name is not None:
+                    faces = [(int(candidate[0]), int(candidate[1]),
+                              int(candidate[2]), int(candidate[3]),
+                              float(candidate[14]))]
+                else:
+                    faces = []
+            else:
+                with state_lock:
+                    settings["recognized_face"] = ""
 
             # Fallback to body detection (HOG) when no face is found AND we
             # need to follow the user. HOG is heavier so we throttle it.
             target_kind = "face"
             persons = []
-            if not faces and settings["follow_me"] and person_detector is not None \
+            if not faces and not profile_names and settings["follow_me"] \
+                    and person_detector is not None \
                     and (detect_count % PERSON_DETECT_EVERY_N == 0):
                 persons = detect_persons(frame)
                 if persons:
@@ -1704,6 +1748,41 @@ def tracking_route():
     with state_lock:
         settings["tracking"] = request.form.get("tracking") == "true"
     return "ok"
+
+
+@app.route("/face_profiles", methods=["GET", "POST", "DELETE"])
+@requires_auth
+def face_profiles_route():
+    if request.method == "GET":
+        return jsonify({
+            "available": face_identity.available,
+            "profiles": face_identity.profiles(),
+        })
+    if not face_identity.available:
+        return jsonify({"ok": False, "error": "modèle SFace indisponible"}), 503
+    if request.method == "DELETE":
+        name = (request.get_json(silent=True) or {}).get("name", "")
+        return jsonify({"ok": face_identity.remove(str(name))})
+    name = request.form.get("name", "")
+    upload = request.files.get("image")
+    if not upload:
+        return jsonify({"ok": False, "error": "image manquante"}), 400
+    image = cv2.imdecode(np.frombuffer(upload.read(), dtype=np.uint8),
+                         cv2.IMREAD_COLOR)
+    if image is None:
+        return jsonify({"ok": False, "error": "image invalide"}), 400
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    details = detect_face_details(image_rgb)
+    if len(details) != 1:
+        return jsonify({"ok": False, "error": "image: un seul visage requis"}), 400
+    feature = face_identity.feature(image_rgb, details[0])
+    if feature is None:
+        return jsonify({"ok": False, "error": "visage non exploitable"}), 400
+    try:
+        face_identity.enroll(name, feature)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "profiles": face_identity.profiles()})
 
 
 @app.route("/settings", methods=["POST"])

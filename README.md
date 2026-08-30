@@ -48,6 +48,25 @@ Les séquences vocales passent par `run_task` : au plus 8 étapes, 12 secondes a
 
 Installer le backend sur le Raspberry Pi avec `pip install -r requirements-yolo.txt`, puis déposer un modèle nano compatible à `/home/solufi/models/yolo11n.pt` (ou définir `PICAR_YOLO_MODEL`). Avec `PICAR_PERSON_DETECTOR=auto`, YOLO est utilisé s'il est disponible; sinon HOG reste le repli automatique.
 
+## Profils de visages locaux
+
+La reconnaissance est optionnelle et reste locale. Installer une version OpenCV incluant
+`FaceRecognizerSF`, puis déposer le modèle SFace à `/home/solufi/models/face_recognition_sface_2021dec.onnx`.
+Les profils contiennent uniquement des empreintes numériques, jamais les photos. Inscrire un
+profil avec une image contenant un seul visage:
+
+```bash
+curl -u "$PICAR_USER:$PICAR_PASS" -F name=Léa -F image=@lea.jpg \
+  http://192.168.2.181:5000/face_profiles
+curl -u "$PICAR_USER:$PICAR_PASS" http://192.168.2.181:5000/face_profiles
+curl -u "$PICAR_USER:$PICAR_PASS" -X DELETE \
+  -H 'Content-Type: application/json' -d '{"name":"Léa"}' \
+  http://192.168.2.181:5000/face_profiles
+```
+
+Quand des profils existent, le suivi utilise uniquement un visage reconnu; sinon il refuse
+le suivi. Sans modèle SFace, le robot conserve son fonctionnement précédent.
+
 ## Diagnostic rapide
 
 ```bash
