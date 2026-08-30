@@ -1,0 +1,30 @@
+[Unit]
+Description=PiCar-X Web Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solufi
+WorkingDirectory=/home/solufi
+EnvironmentFile=-/etc/picar.env
+Environment=LOGNAME=solufi
+Environment=USER=solufi
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PULSE_RUNTIME_PATH=/run/user/1000/pulse
+ExecStart=/home/solufi/picar-env/bin/python /home/solufi/picar_server.py
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=8
+
+# Hardening (modéré — l'app a besoin de I2C, GPIO, camera)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/solufi
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
