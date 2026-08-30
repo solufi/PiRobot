@@ -1334,7 +1334,8 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <button class="small-btn" onclick="toggleCali()">🛠️ CALIBRER</button>
   <button class="small-btn" onclick="toggleChat()">🤖 CHAT</button>
 </div>
-<p>Détection: <span class="value" id="faceStatus">---</span></p>
+<p>Détection: <span class="value" id="faceStatus">---</span>
+  · Identité: <span class="value" id="recognizedStatus">---</span></p>
 <p class="info-bar" style="font-size:13px;">
   📏 <span id="distVal" class="value">--</span> cm
   &nbsp;·&nbsp; 🌗 <span id="gsVal" class="value">--</span>
@@ -1432,6 +1433,7 @@ function applyState(s){
   if (!s) return;
   if (s.settings) {
     document.getElementById("faceStatus").innerText = s.settings.last_face || "---";
+    document.getElementById("recognizedStatus").innerText = s.settings.recognized_face || "---";
     document.getElementById("trackStatus").innerText = s.settings.tracking ? "ON" : "OFF";
     document.getElementById("followStatus").innerText = s.settings.follow_me ? "ON" : "OFF";
     document.getElementById("listenStatus").innerText = s.settings.listening ? "ON" : "OFF";
@@ -1688,6 +1690,19 @@ document.getElementById("faceCapture").addEventListener("click", async () => {
   } catch (e) {
     status.innerText = "Robot indisponible";
   }
+});
+document.getElementById("faceName").insertAdjacentHTML(
+  "afterend", '<button class="small-btn" id="faceDelete">SUPPRIMER</button>');
+document.getElementById("faceDelete").addEventListener("click", async () => {
+  const name = document.getElementById("faceName").value.trim();
+  const status = document.getElementById("faceCaptureStatus");
+  if (!name) { status.innerText = "Prénom requis"; return; }
+  const response = await fetch("/face_profiles", {
+    method:"DELETE", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({name:name})
+  });
+  const data = await response.json();
+  status.innerText = data.ok ? "Profil supprimé" : "Profil introuvable";
 });
 
 function press(action){ wsSend({type:"cmd", action: action}); }

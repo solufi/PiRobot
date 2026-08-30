@@ -6,8 +6,14 @@ set -euo pipefail
 HOST="${1:-solufi@192.168.2.181}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEFAULT_VOLUME_BOOST="${PICAR_VOLUME_BOOST:-180}"
+MDNS_NAME="${PICAR_MDNS_NAME:-robot}"
 YUNET_URL="https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 SFACE_URL="https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
+
+if [[ ! "$MDNS_NAME" =~ ^[a-z0-9][a-z0-9-]{0,61}[a-z0-9]?$ ]]; then
+  echo "Invalid PICAR_MDNS_NAME: ${MDNS_NAME}" >&2
+  exit 2
+fi
 
 echo "==> Deploying to ${HOST}"
 
@@ -21,6 +27,9 @@ scp "${ROOT}/systemd/picar.service" "${HOST}:/tmp/picar.service"
 ssh "${HOST}" '
   # Ensure mpg123 is installed for MP3 TTS playback
   command -v mpg123 >/dev/null 2>&1 || sudo apt-get install -y -q mpg123
+  command -v avahi-daemon >/dev/null 2>&1 || sudo apt-get install -y -q avahi-daemon
+  sudo systemctl enable --now avahi-daemon
+  sudo hostnamectl set-hostname '"${MDNS_NAME}"'
   sudo install -m 0644 /tmp/picar.service /etc/systemd/system/picar.service
   rm -f /tmp/picar.service
   # Clean obsolete drop-in (now baked into the unit)

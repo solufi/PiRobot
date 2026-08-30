@@ -22,6 +22,9 @@ scripts/deploy.sh             # scp + restart + healthcheck
 Le script copie l'app, télécharge automatiquement les modèles YuNet/SFace s'ils manquent,
 met à jour l'unit systemd, supprime l'ancien drop-in, recharge et redémarre. Il vérifie ensuite
 que le service est `active` et que `/healthz` répond.
+Il installe aussi Avahi et configure `robot.local` par défaut; pour un autre nom:
+`PICAR_MDNS_NAME=jamal ./scripts/deploy.sh user@host`. Les clients doivent être sur le même
+réseau et autoriser mDNS; sinon utiliser l'adresse IP.
 
 ## Configuration runtime
 
