@@ -16,6 +16,7 @@ from picamera2 import Picamera2
 import cv2
 
 from gpt_brain import GPTBrain
+from task_policy import validate_steps
 
 try:
     from robot_hat.utils import enable_speaker
@@ -115,7 +116,9 @@ state_lock = threading.RLock()
 motor_lock = threading.RLock()
 drive_cancel = threading.Event()
 task_lock = threading.Lock()
+last_manual_command = time.monotonic()
 frame_lock = threading.Lock()
+frame_condition = threading.Condition(frame_lock)
 latest_frame = None         # numpy RGB array (raw)
 latest_overlay = None       # numpy RGB array with face box drawn (when tracking on)
 frame_seq = 0
@@ -183,9 +186,16 @@ def update_movement():
             angle += settings["turn_angle"]
         px.set_dir_servo_angle(angle)
 
-        if control["forward"] and not control["backward"]:
+        moving_forward = control["forward"] and not control["backward"]
+        moving_backward = control["backward"] and not control["forward"]
+        blocked = settings["safety"] and (
+            settings["cliff"] or (settings["obstacle"] and moving_forward)
+        )
+        if blocked:
+            px.stop()
+        elif moving_forward:
             px.forward(settings["speed"])
-        elif control["backward"] and not control["forward"]:
+        elif moving_backward:
             px.backward(settings["speed"])
         else:
             px.stop()
@@ -210,6 +220,19 @@ def safety_blocks(direction: str) -> bool:
     if not safety:
         return False
     return cliff or (obstacle and direction in {"forward", "left", "right"})
+
+
+def control_watchdog_loop():
+    timeout = max(0.5, float(os.environ.get("PICAR_CONTROL_TIMEOUT", "1.5")))
+    log.info("control watchdog started (timeout=%.1fs)", timeout)
+    while True:
+        with state_lock:
+            active = any(control.values())
+            stale = time.monotonic() - last_manual_command > timeout
+        if active and stale:
+            log.warning("manual control heartbeat timed out; stopping motors")
+            stop_all()
+        time.sleep(0.2)
 
 
 def camera_center():
@@ -244,6 +267,7 @@ def capture_loop():
             with frame_lock:
                 latest_frame = frame
                 frame_seq += 1
+                frame_condition.notify_all()
         except Exception:
             log.exception("capture error")
             time.sleep(0.1)
@@ -568,6 +592,7 @@ def sensor_loop():
 threading.Thread(target=capture_loop, daemon=True, name="capture").start()
 threading.Thread(target=tracking_loop, daemon=True, name="tracking").start()
 threading.Thread(target=sensor_loop, daemon=True, name="sensor").start()
+threading.Thread(target=control_watchdog_loop, daemon=True, name="watchdog").start()
 # Note: listen thread is started further below, after listen_loop is defined.
 
 
@@ -607,6 +632,8 @@ def mjpeg_gen():
     while True:
         with frame_lock:
             if frame_seq == last_seq:
+                frame_condition.wait(timeout=1.0)
+            if frame_seq == last_seq:
                 frame = None
             else:
                 frame = (latest_overlay if (settings["tracking"] and latest_overlay is not None)
@@ -630,12 +657,15 @@ def mjpeg_gen():
 # Control dispatcher (shared by HTTP /cmd and WebSocket)
 # ---------------------------------------------------------------------------
 def dispatch_action(action):
+    global last_manual_command
     with state_lock:
         if action in control:
+            last_manual_command = time.monotonic()
             control[action] = True
         elif action.startswith("release_"):
             key = action[len("release_"):]
             if key in control:
+                last_manual_command = time.monotonic()
                 control[key] = False
         elif action == "stop":
             stop_all()
@@ -710,39 +740,22 @@ def act_drive(direction: str, duration_ms: int = 600):
 
 
 def act_run_task(steps: list[dict]) -> dict:
-    if not isinstance(steps, list) or not 1 <= len(steps) <= 8:
-        return {"ok": False, "error": "une tâche doit contenir 1 à 8 étapes"}
-    total_ms = 0
+    try:
+        normalized, total_ms = validate_steps(steps)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     with task_lock:
         drive_cancel.clear()
-        for step in steps:
-            if not isinstance(step, dict):
-                return {"ok": False, "error": "étape invalide"}
+        for step in normalized:
             action = step.get("action")
             if action == "drive":
                 direction = step.get("direction")
                 duration_ms = step.get("duration_ms", 600)
-                if direction not in {"forward", "backward", "left", "right", "stop"}:
-                    return {"ok": False, "error": "direction invalide"}
-                try:
-                    duration_ms = max(100, min(int(duration_ms), 1500))
-                except (TypeError, ValueError):
-                    return {"ok": False, "error": "durée invalide"}
-                total_ms += duration_ms
-                if total_ms > 12000:
-                    return {"ok": False, "error": "durée totale maximale dépassée"}
                 act_drive(direction, duration_ms)
                 if direction == "stop":
                     drive_cancel.clear()
             elif action == "wait":
                 duration_ms = step.get("duration_ms", 100)
-                try:
-                    duration_ms = max(100, min(int(duration_ms), 1500))
-                except (TypeError, ValueError):
-                    return {"ok": False, "error": "durée invalide"}
-                total_ms += duration_ms
-                if total_ms > 12000:
-                    return {"ok": False, "error": "durée totale maximale dépassée"}
                 if drive_cancel.wait(duration_ms / 1000.0):
                     return {"ok": False, "cancelled": True}
             else:
@@ -750,7 +763,7 @@ def act_run_task(steps: list[dict]) -> dict:
             if drive_cancel.is_set():
                 return {"ok": False, "cancelled": True}
         stop_all()
-    return {"ok": True, "steps": len(steps), "duration_ms": total_ms}
+    return {"ok": True, "steps": len(normalized), "duration_ms": total_ms}
 
 
 def act_set_speed(speed: int):
@@ -1311,6 +1324,9 @@ function wsSend(obj){
   }
   return false;
 }
+setInterval(() => {
+  if (wsReady && Object.values(held).some(Boolean)) wsSend({type:"heartbeat"});
+}, 400);
 let volumeUserDragging = false;
 function applyState(s){
   if (!s) return;
@@ -1617,7 +1633,12 @@ def index():
 @requires_auth
 def video():
     return Response(mjpeg_gen(),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+                    mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={
+                        "Cache-Control": "no-store, no-cache, must-revalidate",
+                        "Pragma": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    })
 
 
 @app.route("/status")
@@ -1864,6 +1885,10 @@ def ws_endpoint(ws):
             elif mtype == "ping":
                 try: ws.send(json.dumps({"type": "pong", "t": msg.get("t")}))
                 except Exception: break
+            elif mtype == "heartbeat":
+                with state_lock:
+                    global last_manual_command
+                    last_manual_command = time.monotonic()
     finally:
         stop_evt.set()
         log.info("ws client disconnected")
