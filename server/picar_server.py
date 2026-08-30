@@ -7,16 +7,18 @@ Architecture:
 - WebSocket /ws handles control events (drive, settings, camera, tracking, stop).
 - HTTP POST endpoints kept as fallback for the legacy UI.
 """
-import os, getpass, base64, functools, logging, threading, time, json, subprocess, tempfile, uuid, pathlib, math
-os.getlogin = lambda: getpass.getuser()
+import os, base64, functools, logging, threading, time, json, subprocess, tempfile, uuid, pathlib, math
 
 from flask import Flask, render_template_string, request, jsonify, Response, send_file, abort
 from flask_sock import Sock
 from picarx import Picarx
 from picamera2 import Picamera2
 import cv2
+import numpy as np
 
 from gpt_brain import GPTBrain
+from face_identity import FaceIdentity
+from task_policy import validate_steps
 
 try:
     from robot_hat.utils import enable_speaker
@@ -29,6 +31,9 @@ log = logging.getLogger("picar")
 
 app = Flask(__name__)
 sock = Sock(app)
+app.config["MAX_CONTENT_LENGTH"] = int(
+    os.environ.get("PICAR_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024))
+)
 px = Picarx()
 
 AUTH_USER = os.environ.get("PICAR_USER")
@@ -37,6 +42,13 @@ AUTH_PASS = os.environ.get("PICAR_PASS")
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
+try:
+    DEFAULT_VOLUME_BOOST = max(
+        0, min(300, int(os.environ.get("PICAR_VOLUME_BOOST", "150")))
+    )
+except ValueError:
+    DEFAULT_VOLUME_BOOST = 150
+
 settings = {
     "speed": 70,
     "turn_angle": 30,
@@ -47,7 +59,7 @@ settings = {
     "last_face": "OFF",
     "volume": 100,
     # Software gain boost applied on top of amixer (100 = unity, 200 = +6dB, 300 = +9.5dB)
-    "volume_boost": 150,
+    "volume_boost": DEFAULT_VOLUME_BOOST,
     "cam_pan_cali": 0.0,
     "cam_tilt_cali": 0.0,
     "dir_cali": 0.0,
@@ -61,6 +73,7 @@ settings = {
     # Continuous listening with wake word
     "listening": False,
     "last_heard": "",
+    "recognized_face": "",
 }
 
 # Safety thresholds
@@ -74,8 +87,21 @@ PI_MIC_DEVICE = os.environ.get("PICAR_MIC", "plughw:CARD=Device,DEV=0")
 PI_MIC_SECONDS = float(os.environ.get("PICAR_MIC_SECONDS", "5"))
 TTS_DIR = pathlib.Path(tempfile.gettempdir()) / "picar_tts"
 TTS_DIR.mkdir(exist_ok=True)
+UPDATE_STATUS = pathlib.Path("/home/solufi/update-status.json")
 tts_play_lock = threading.Lock()
 mic_lock = threading.Lock()  # serialize arecord usage between /voice/pi and listen_loop
+
+
+def cleanup_tts_files(max_age_seconds: int = 3600):
+    cutoff = time.time() - max_age_seconds
+    for path in TTS_DIR.glob("tts_*.mp3"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            log.warning("could not remove stale TTS file: %s", path)
 
 # Wake word config
 WAKE_WORD = os.environ.get("PICAR_WAKE_WORD", "jamal").lower()
@@ -97,8 +123,13 @@ control = {
     "right": False,
 }
 
-state_lock = threading.Lock()
+state_lock = threading.RLock()
+motor_lock = threading.RLock()
+drive_cancel = threading.Event()
+task_lock = threading.Lock()
+last_manual_command = time.monotonic()
 frame_lock = threading.Lock()
+frame_condition = threading.Condition(frame_lock)
 latest_frame = None         # numpy RGB array (raw)
 latest_overlay = None       # numpy RGB array with face box drawn (when tracking on)
 frame_seq = 0
@@ -137,18 +168,36 @@ if face_detector is None:
     face_cascade = cv2.CascadeClassifier(
         "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml"
     )
+face_identity = FaceIdentity()
+settings["face_threshold"] = face_identity.threshold
 
 # Full-body person detector (HOG + linear SVM, built into OpenCV).
 # Heavier than YuNet (~50ms on Pi 5 at 320x240) so we run it less often.
 PERSON_DETECT_EVERY_N = int(os.environ.get("PICAR_PERSON_EVERY_N", "5"))
+PERSON_DETECTOR = os.environ.get("PICAR_PERSON_DETECTOR", "auto").lower()
+yolo_detector = None
+YOLO_DEVICE = os.environ.get("PICAR_YOLO_DEVICE", "cpu")
+YOLO_CONFIDENCE = float(os.environ.get("PICAR_YOLO_CONFIDENCE", "0.35"))
+YOLO_MODEL = os.environ.get("PICAR_YOLO_MODEL", "/home/solufi/models/yolo11n.pt")
+if PERSON_DETECTOR in {"auto", "yolo"} and os.path.isfile(YOLO_MODEL):
+    try:
+        from ultralytics import YOLO
+        yolo_detector = YOLO(YOLO_MODEL)
+        log.info("YOLO person detector loaded (%s, device=%s)", YOLO_MODEL, YOLO_DEVICE)
+    except Exception:
+        log.exception("YOLO init failed; falling back to HOG")
+elif PERSON_DETECTOR == "yolo":
+    log.warning("YOLO requested but model not found at %s; falling back to HOG", YOLO_MODEL)
+
 person_detector = None
-try:
-    person_detector = cv2.HOGDescriptor()
-    person_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    log.info("HOG person detector loaded")
-except Exception:
-    log.exception("HOG person detector init failed")
-    person_detector = None
+if yolo_detector is None:
+    try:
+        person_detector = cv2.HOGDescriptor()
+        person_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        log.info("HOG person detector loaded")
+    except Exception:
+        log.exception("HOG person detector init failed")
+        person_detector = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -158,26 +207,61 @@ def clamp(v, mi, ma):
 
 
 def update_movement():
-    angle = 0
-    if control["left"]:
-        angle -= settings["turn_angle"]
-    if control["right"]:
-        angle += settings["turn_angle"]
-    px.set_dir_servo_angle(angle)
+    with motor_lock:
+        angle = 0
+        if control["left"]:
+            angle -= settings["turn_angle"]
+        if control["right"]:
+            angle += settings["turn_angle"]
+        px.set_dir_servo_angle(angle)
 
-    if control["forward"] and not control["backward"]:
-        px.forward(settings["speed"])
-    elif control["backward"] and not control["forward"]:
-        px.backward(settings["speed"])
-    else:
-        px.stop()
+        moving_forward = control["forward"] and not control["backward"]
+        moving_backward = control["backward"] and not control["forward"]
+        blocked = settings["safety"] and (
+            settings["cliff"] or (settings["obstacle"] and moving_forward)
+        )
+        if blocked:
+            px.stop()
+        elif moving_forward:
+            px.forward(settings["speed"])
+        elif moving_backward:
+            px.backward(settings["speed"])
+        else:
+            px.stop()
 
 
 def stop_all():
-    for k in control:
-        control[k] = False
-    px.stop()
-    px.set_dir_servo_angle(0)
+    drive_cancel.set()
+    with state_lock:
+        for k in control:
+            control[k] = False
+    with motor_lock:
+        px.stop()
+        px.set_dir_servo_angle(0)
+
+
+def safety_blocks(direction: str) -> bool:
+    """Return whether safety sensors currently forbid a movement."""
+    with state_lock:
+        safety = settings["safety"]
+        obstacle = settings["obstacle"]
+        cliff = settings["cliff"]
+    if not safety:
+        return False
+    return cliff or (obstacle and direction in {"forward", "left", "right"})
+
+
+def control_watchdog_loop():
+    timeout = max(0.5, float(os.environ.get("PICAR_CONTROL_TIMEOUT", "1.5")))
+    log.info("control watchdog started (timeout=%.1fs)", timeout)
+    while True:
+        with state_lock:
+            active = any(control.values())
+            stale = time.monotonic() - last_manual_command > timeout
+        if active and stale:
+            log.warning("manual control heartbeat timed out; stopping motors")
+            stop_all()
+        time.sleep(0.2)
 
 
 def camera_center():
@@ -212,6 +296,7 @@ def capture_loop():
             with frame_lock:
                 latest_frame = frame
                 frame_seq += 1
+                frame_condition.notify_all()
         except Exception:
             log.exception("capture error")
             time.sleep(0.1)
@@ -243,8 +328,55 @@ def detect_faces(frame_rgb):
     return [(int(x), int(y), int(w), int(h), 1.0) for (x, y, w, h) in faces]
 
 
+def detect_face_details(frame_rgb):
+    if face_detector is None:
+        return []
+    small = cv2.resize(frame_rgb, DETECT_SIZE)
+    bgr = cv2.cvtColor(small, cv2.COLOR_RGB2BGR)
+    _, faces = face_detector.detect(bgr)
+    if faces is None:
+        return []
+    details = []
+    for face in faces:
+        scaled = face.astype(float).copy()
+        scaled[0:4] *= (DETECT_SCALE_X, DETECT_SCALE_Y,
+                        DETECT_SCALE_X, DETECT_SCALE_Y)
+        scaled[4:14:2] *= DETECT_SCALE_X
+        scaled[5:14:2] *= DETECT_SCALE_Y
+        details.append(tuple(scaled.tolist()))
+    return details
+
+
 def detect_persons(frame_rgb):
     """Return list of (x,y,w,h,score) of full-body persons in CAM_SIZE coords."""
+    if yolo_detector is not None:
+        try:
+            results = yolo_detector.predict(
+                frame_rgb,
+                imgsz=DETECT_SIZE[0],
+                conf=YOLO_CONFIDENCE,
+                classes=[0],
+                device=YOLO_DEVICE,
+                verbose=False,
+            )
+            out = []
+            for result in results:
+                if result.boxes is None:
+                    continue
+                for box, score in zip(
+                    result.boxes.xyxy.tolist(), result.boxes.conf.tolist()
+                ):
+                    x1, y1, x2, y2 = box
+                    out.append((
+                        int(x1),
+                        int(y1),
+                        int(x2 - x1),
+                        int(y2 - y1),
+                        float(score),
+                    ))
+            return out
+        except Exception:
+            log.exception("YOLO detection failed; using HOG for this frame")
     if person_detector is None:
         return []
     small = cv2.resize(frame_rgb, DETECT_SIZE)
@@ -316,12 +448,33 @@ def tracking_loop():
             faces = detect_faces(frame)
             detect_ms = (time.time() - t0) * 1000.0
             detect_count += 1
+            recognized_name = None
+            profile_names = face_identity.profiles() if face_identity.available else []
+            if profile_names:
+                details = detect_face_details(frame)
+                if details:
+                    candidate = max(details, key=lambda face: face[2] * face[3])
+                    feature = face_identity.feature(frame, candidate)
+                    if feature is not None:
+                        recognized_name = face_identity.identify(feature)
+                with state_lock:
+                    settings["recognized_face"] = recognized_name or "inconnu"
+                if recognized_name is not None:
+                    faces = [(int(candidate[0]), int(candidate[1]),
+                              int(candidate[2]), int(candidate[3]),
+                              float(candidate[14]))]
+                else:
+                    faces = []
+            else:
+                with state_lock:
+                    settings["recognized_face"] = ""
 
             # Fallback to body detection (HOG) when no face is found AND we
             # need to follow the user. HOG is heavier so we throttle it.
             target_kind = "face"
             persons = []
-            if not faces and settings["follow_me"] and person_detector is not None \
+            if not faces and not profile_names and settings["follow_me"] \
+                    and person_detector is not None \
                     and (detect_count % PERSON_DETECT_EVERY_N == 0):
                 persons = detect_persons(frame)
                 if persons:
@@ -536,6 +689,7 @@ def sensor_loop():
 threading.Thread(target=capture_loop, daemon=True, name="capture").start()
 threading.Thread(target=tracking_loop, daemon=True, name="tracking").start()
 threading.Thread(target=sensor_loop, daemon=True, name="sensor").start()
+threading.Thread(target=control_watchdog_loop, daemon=True, name="watchdog").start()
 # Note: listen thread is started further below, after listen_loop is defined.
 
 
@@ -545,19 +699,25 @@ threading.Thread(target=sensor_loop, daemon=True, name="sensor").start()
 def requires_auth(fn):
     @functools.wraps(fn)
     def wrapper(*a, **kw):
-        if not AUTH_USER:
+        if _request_is_authorized():
             return fn(*a, **kw)
-        h = request.headers.get("Authorization", "")
-        if h.startswith("Basic "):
-            try:
-                u, p = base64.b64decode(h[6:]).decode("utf-8", "ignore").split(":", 1)
-                if u == AUTH_USER and p == AUTH_PASS:
-                    return fn(*a, **kw)
-            except Exception:
-                pass
         return Response("Auth required", 401,
                         {"WWW-Authenticate": 'Basic realm="PiCar-X"'})
     return wrapper
+
+
+def _request_is_authorized():
+    if not AUTH_USER:
+        return True
+    h = request.headers.get("Authorization", "")
+    if h.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(h[6:], validate=True).decode("utf-8")
+            u, p = decoded.split(":", 1)
+            return u == AUTH_USER and p == AUTH_PASS
+        except Exception:
+            pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -568,6 +728,8 @@ def mjpeg_gen():
     last_seq = -1
     while True:
         with frame_lock:
+            if frame_seq == last_seq:
+                frame_condition.wait(timeout=1.0)
             if frame_seq == last_seq:
                 frame = None
             else:
@@ -592,12 +754,15 @@ def mjpeg_gen():
 # Control dispatcher (shared by HTTP /cmd and WebSocket)
 # ---------------------------------------------------------------------------
 def dispatch_action(action):
+    global last_manual_command
     with state_lock:
         if action in control:
+            last_manual_command = time.monotonic()
             control[action] = True
         elif action.startswith("release_"):
             key = action[len("release_"):]
             if key in control:
+                last_manual_command = time.monotonic()
                 control[key] = False
         elif action == "stop":
             stop_all()
@@ -638,21 +803,64 @@ def apply_camera_settings(pan=None, tilt=None):
 # ---------------------------------------------------------------------------
 def act_drive(direction: str, duration_ms: int = 600):
     duration_ms = max(100, min(int(duration_ms), 1500))
-    sp = settings["speed"]
+    if direction not in {"forward", "backward", "left", "right", "stop"}:
+        return
+    if direction != "stop" and safety_blocks(direction):
+        stop_all()
+        return
+    with state_lock:
+        sp = settings["speed"]
+        turn_angle = settings["turn_angle"]
     if direction == "stop":
         stop_all(); return
-    if direction == "forward":
-        px.set_dir_servo_angle(0); px.forward(sp)
-    elif direction == "backward":
-        px.set_dir_servo_angle(0); px.backward(sp)
-    elif direction == "left":
-        px.set_dir_servo_angle(-settings["turn_angle"]); px.forward(sp)
-    elif direction == "right":
-        px.set_dir_servo_angle(settings["turn_angle"]); px.forward(sp)
-    else:
-        return
-    time.sleep(duration_ms / 1000.0)
-    px.stop(); px.set_dir_servo_angle(0)
+    drive_cancel.clear()
+    with motor_lock:
+        turn = 0
+        if direction == "left":
+            turn = -turn_angle
+        elif direction == "right":
+            turn = turn_angle
+        px.set_dir_servo_angle(turn)
+        if direction == "backward":
+            px.backward(sp)
+        else:
+            px.forward(sp)
+    deadline = time.monotonic() + duration_ms / 1000.0
+    while time.monotonic() < deadline and not drive_cancel.is_set():
+        if safety_blocks(direction):
+            drive_cancel.set()
+            break
+        time.sleep(0.05)
+    with motor_lock:
+        px.stop()
+        px.set_dir_servo_angle(0)
+
+
+def act_run_task(steps: list[dict]) -> dict:
+    try:
+        normalized, total_ms = validate_steps(steps)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    with task_lock:
+        drive_cancel.clear()
+        for step in normalized:
+            action = step.get("action")
+            if action == "drive":
+                direction = step.get("direction")
+                duration_ms = step.get("duration_ms", 600)
+                act_drive(direction, duration_ms)
+                if direction == "stop":
+                    drive_cancel.clear()
+            elif action == "wait":
+                duration_ms = step.get("duration_ms", 100)
+                if drive_cancel.wait(duration_ms / 1000.0):
+                    return {"ok": False, "cancelled": True}
+            else:
+                return {"ok": False, "error": "action invalide"}
+            if drive_cancel.is_set():
+                return {"ok": False, "cancelled": True}
+        stop_all()
+    return {"ok": True, "steps": len(normalized), "duration_ms": total_ms}
 
 
 def act_set_speed(speed: int):
@@ -738,6 +946,7 @@ def apply_calibration(target: str, value: float):
 
 brain = GPTBrain({
     "drive": act_drive,
+    "run_task": act_run_task,
     "set_speed": act_set_speed,
     "set_camera": act_set_camera,
     "set_follow_me": act_set_follow_me,
@@ -1029,6 +1238,7 @@ def set_volume(percent: int) -> int:
 def tts_to_file(text: str) -> str | None:
     if not brain.enabled or not text.strip():
         return None
+    cleanup_tts_files()
     out = TTS_DIR / f"tts_{uuid.uuid4().hex}.mp3"
     log.info("TTS: creating file %s for text: %r", out, text[:50])
     try:
@@ -1126,7 +1336,8 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <button class="small-btn" onclick="toggleCali()">🛠️ CALIBRER</button>
   <button class="small-btn" onclick="toggleChat()">🤖 CHAT</button>
 </div>
-<p>Détection: <span class="value" id="faceStatus">---</span></p>
+<p>Détection: <span class="value" id="faceStatus">---</span>
+  · Identité: <span class="value" id="recognizedStatus">---</span></p>
 <p class="info-bar" style="font-size:13px;">
   📏 <span id="distVal" class="value">--</span> cm
   &nbsp;·&nbsp; 🌗 <span id="gsVal" class="value">--</span>
@@ -1155,6 +1366,16 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <input id="volume" type="range" min="0" max="100" value="100">
   <label>🔊 Boost (gain logiciel): <span class="value" id="boostValue">150</span>%</label>
   <input id="boost" type="range" min="50" max="300" value="150">
+  <label>Profil visage local</label>
+  <input id="faceName" type="text" placeholder="Prénom" maxlength="40"
+         style="width:60%;padding:6px;border-radius:6px;border:none;background:#222;color:#eee;">
+  <button class="small-btn" id="faceCapture">ENREGISTRER PAR CAMÉRA</button>
+  <span id="faceCaptureStatus" style="font-size:12px;"></span>
+  <label>Seuil de reconnaissance: <span class="value" id="faceThresholdValue">0.363</span></label>
+  <input id="faceThreshold" type="range" min="0.200" max="0.800" step="0.001" value="0.363">
+  <label>Mise à jour du robot</label>
+  <button class="small-btn" id="updateBtn">METTRE À JOUR</button>
+  <span id="updateStatus" style="font-size:12px;"></span>
   <br><br>
   <button class="small-btn" data-once="center">CENTER</button>
   <button class="small-btn" data-once="cam_center">CAM CENTER</button>
@@ -1211,11 +1432,19 @@ function wsSend(obj){
   }
   return false;
 }
+setInterval(() => {
+  if (wsReady && Object.values(held).some(Boolean)) wsSend({type:"heartbeat"});
+}, 400);
 let volumeUserDragging = false;
 function applyState(s){
   if (!s) return;
   if (s.settings) {
     document.getElementById("faceStatus").innerText = s.settings.last_face || "---";
+    document.getElementById("recognizedStatus").innerText = s.settings.recognized_face || "---";
+    if (typeof s.settings.face_threshold === "number") {
+      document.getElementById("faceThreshold").value = s.settings.face_threshold;
+      document.getElementById("faceThresholdValue").innerText = s.settings.face_threshold.toFixed(3);
+    }
     document.getElementById("trackStatus").innerText = s.settings.tracking ? "ON" : "OFF";
     document.getElementById("followStatus").innerText = s.settings.follow_me ? "ON" : "OFF";
     document.getElementById("listenStatus").innerText = s.settings.listening ? "ON" : "OFF";
@@ -1458,6 +1687,68 @@ bindRange("tilt","tilt");
     }, 120);
   });
 })();
+document.getElementById("faceCapture").addEventListener("click", async () => {
+  const name = document.getElementById("faceName").value.trim();
+  const status = document.getElementById("faceCaptureStatus");
+  if (!name) { status.innerText = "Prénom requis"; return; }
+  status.innerText = "Regardez la caméra...";
+  const form = new FormData();
+  form.append("name", name);
+  try {
+    const response = await fetch("/face_profiles/capture", {method:"POST", body:form});
+    const data = await response.json();
+    status.innerText = data.ok ? `Enregistré (${data.captures} captures)` : (data.error || "Échec");
+  } catch (e) {
+    status.innerText = "Robot indisponible";
+  }
+});
+document.getElementById("faceName").insertAdjacentHTML(
+  "afterend", '<button class="small-btn" id="faceDelete">SUPPRIMER</button>');
+document.getElementById("faceDelete").addEventListener("click", async () => {
+  const name = document.getElementById("faceName").value.trim();
+  const status = document.getElementById("faceCaptureStatus");
+  if (!name) { status.innerText = "Prénom requis"; return; }
+  const response = await fetch("/face_profiles", {
+    method:"DELETE", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({name:name})
+  });
+  const data = await response.json();
+  status.innerText = data.ok ? "Profil supprimé" : "Profil introuvable";
+});
+document.getElementById("faceThreshold").addEventListener("change", async (event) => {
+  const threshold = parseFloat(event.target.value);
+  document.getElementById("faceThresholdValue").innerText = threshold.toFixed(3);
+  await fetch("/face_settings", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({threshold:threshold})
+  });
+});
+document.getElementById("updateBtn").addEventListener("click", async () => {
+  const button = document.getElementById("updateBtn");
+  const status = document.getElementById("updateStatus");
+  button.disabled = true;
+  status.innerText = "Mise à jour en cours…";
+  try {
+    const response = await fetch("/update", {method:"POST"});
+    const data = await response.json();
+    status.innerText = data.message || data.error || "Demande envoyée";
+    if (response.ok) {
+      const poll = setInterval(async () => {
+        try {
+          const current = await (await fetch("/update")).json();
+          status.innerText = current.message || current.state;
+          if (["success", "error"].includes(current.state)) clearInterval(poll);
+        } catch (e) {
+          clearInterval(poll);
+        }
+      }, 2000);
+    }
+  } catch (e) {
+    status.innerText = "Impossible de lancer la mise à jour";
+  } finally {
+    setTimeout(() => { button.disabled = false; }, 3000);
+  }
+});
 
 function press(action){ wsSend({type:"cmd", action: action}); }
 function release(action){ wsSend({type:"cmd", action: "release_" + action}); }
@@ -1517,20 +1808,139 @@ def index():
 @requires_auth
 def video():
     return Response(mjpeg_gen(),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+                    mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={
+                        "Cache-Control": "no-store, no-cache, must-revalidate",
+                        "Pragma": "no-cache",
+                        "X-Accel-Buffering": "no",
+                    })
 
 
 @app.route("/status")
 @requires_auth
 def status():
-    return jsonify(settings)
+    return jsonify(state_snapshot()["settings"])
 
 
 @app.route("/tracking", methods=["POST"])
 @requires_auth
 def tracking_route():
-    settings["tracking"] = request.form.get("tracking") == "true"
+    with state_lock:
+        settings["tracking"] = request.form.get("tracking") == "true"
     return "ok"
+
+
+@app.route("/face_profiles", methods=["GET", "POST", "DELETE"])
+@requires_auth
+def face_profiles_route():
+    if request.method == "GET":
+        return jsonify({
+            "available": face_identity.available,
+            "profiles": face_identity.profiles(),
+        })
+    if not face_identity.available:
+        return jsonify({"ok": False, "error": "modèle SFace indisponible"}), 503
+    if request.method == "DELETE":
+        name = (request.get_json(silent=True) or {}).get("name", "")
+        return jsonify({"ok": face_identity.remove(str(name))})
+    name = request.form.get("name", "")
+    upload = request.files.get("image")
+    if not upload:
+        return jsonify({"ok": False, "error": "image manquante"}), 400
+    image = cv2.imdecode(np.frombuffer(upload.read(), dtype=np.uint8),
+                         cv2.IMREAD_COLOR)
+    if image is None:
+        return jsonify({"ok": False, "error": "image invalide"}), 400
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    details = detect_face_details(image_rgb)
+    if len(details) != 1:
+        return jsonify({"ok": False, "error": "image: un seul visage requis"}), 400
+    feature = face_identity.feature(image_rgb, details[0])
+    if feature is None:
+        return jsonify({"ok": False, "error": "visage non exploitable"}), 400
+    try:
+        face_identity.enroll(name, feature)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "profiles": face_identity.profiles()})
+
+
+@app.route("/face_profiles/capture", methods=["POST"])
+@requires_auth
+def face_profiles_capture_route():
+    if not face_identity.available:
+        return jsonify({"ok": False, "error": "modèle SFace indisponible"}), 503
+    name = request.form.get("name", "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "nom manquant"}), 400
+
+    features = []
+    for _ in range(7):
+        with frame_lock:
+            frame = latest_frame.copy() if latest_frame is not None else None
+        if frame is not None:
+            details = detect_face_details(frame)
+            if len(details) == 1:
+                feature = face_identity.feature(frame, details[0])
+                if feature is not None:
+                    features.append(np.asarray(feature, dtype=np.float32))
+        if len(features) >= 5:
+            break
+        time.sleep(0.25)
+
+    if len(features) < 5:
+        return jsonify({
+            "ok": False,
+            "error": "visage instable: gardez un seul visage devant la caméra",
+        }), 400
+    average = np.mean(features, axis=0)
+    average /= max(float(np.linalg.norm(average)), 1e-12)
+    try:
+        face_identity.enroll(name, average.tolist())
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({
+        "ok": True,
+        "profiles": face_identity.profiles(),
+        "captures": len(features),
+    })
+
+
+@app.route("/face_settings", methods=["GET", "POST"])
+@requires_auth
+def face_settings_route():
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        try:
+            threshold = face_identity.set_threshold(data.get("threshold"))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "seuil invalide"}), 400
+        with state_lock:
+            settings["face_threshold"] = threshold
+        return jsonify({"ok": True, "threshold": threshold})
+    return jsonify({"threshold": face_identity.threshold})
+
+
+@app.route("/update", methods=["GET", "POST"])
+@requires_auth
+def update_route():
+    if request.method == "GET":
+        try:
+            return jsonify(json.loads(UPDATE_STATUS.read_text()))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return jsonify({"state": "idle", "message": "Aucune mise à jour exécutée"})
+    try:
+        subprocess.Popen(
+            ["/usr/local/sbin/picar-update"],
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        return jsonify({
+            "ok": False,
+            "error": "mise à jour indisponible: lancez deploy.sh d'abord",
+        }), 503
+    return jsonify({"ok": True, "message": "Mise à jour démarrée"}), 202
 
 
 @app.route("/settings", methods=["POST"])
@@ -1572,7 +1982,7 @@ def volume_route():
 def say_route():
     """Quick TTS test: synthesize text and play it on the Pi speaker."""
     data = request.get_json(silent=True) or {}
-    text = (data.get("text") or "Bonjour, je suis le robot.").strip()
+    text = (data.get("text") or "Bonjour, je suis le robot.").strip()[:500]
     if not brain.enabled:
         return jsonify({"ok": False, "error": "OPENAI_API_KEY non configurée"}), 503
     path = tts_to_file(text)
@@ -1590,11 +2000,12 @@ def calibration_route():
         for k in ("cam_pan", "cam_tilt", "dir"):
             if k in data:
                 apply_calibration(k, data[k])
-    return jsonify({
-        "cam_pan": settings["cam_pan_cali"],
-        "cam_tilt": settings["cam_tilt_cali"],
-        "dir": settings["dir_cali"],
-    })
+    with state_lock:
+        return jsonify({
+            "cam_pan": settings["cam_pan_cali"],
+            "cam_tilt": settings["cam_tilt_cali"],
+            "dir": settings["dir_cali"],
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -1604,7 +2015,7 @@ def _process_user_message(message: str, speak_on_pi: bool) -> dict:
     """Send a user message to the brain, optionally play TTS on the Pi."""
     if not brain.enabled:
         return {"ok": False, "error": "OPENAI_API_KEY non configurée"}
-    result = brain.chat(message)
+    result = brain.chat(message[:2000])
     reply = result.get("reply", "")
     tts_path = tts_to_file(reply)
     tts_id = pathlib.Path(tts_path).name if tts_path else None
@@ -1637,7 +2048,10 @@ def voice_pi_route():
     if not brain.enabled:
         return jsonify({"ok": False, "error": "OPENAI_API_KEY non configurée"}), 503
     data = request.get_json(silent=True) or {}
-    seconds = float(data.get("seconds", PI_MIC_SECONDS))
+    try:
+        seconds = float(data.get("seconds", PI_MIC_SECONDS))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "durée invalide"}), 400
     seconds = max(1.0, min(seconds, 15.0))
     try:
         wav = record_pi_mic(seconds)
@@ -1693,6 +2107,9 @@ def tts_route(name):
 # ---------------------------------------------------------------------------
 @sock.route("/ws")
 def ws_endpoint(ws):
+    if not _request_is_authorized():
+        ws.close()
+        return
     log.info("ws client connected")
     # initial state push
     try:
@@ -1756,8 +2173,13 @@ def ws_endpoint(ws):
             elif mtype == "ping":
                 try: ws.send(json.dumps({"type": "pong", "t": msg.get("t")}))
                 except Exception: break
+            elif mtype == "heartbeat":
+                with state_lock:
+                    global last_manual_command
+                    last_manual_command = time.monotonic()
     finally:
         stop_evt.set()
+        stop_all()
         log.info("ws client disconnected")
 
 
