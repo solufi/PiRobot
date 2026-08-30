@@ -1,0 +1,2 @@
+# Optional person detection backend for Raspberry Pi.
+ultralytics==8.3.253

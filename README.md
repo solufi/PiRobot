@@ -43,6 +43,10 @@ Recharge: `sudo systemctl restart picar.service`.
 
 Les séquences vocales passent par `run_task` : au plus 8 étapes, 12 secondes au total et 1,5 seconde par mouvement. Une commande `stop` ou un obstacle/falaise interrompt la séquence.
 
+## Détection YOLO optionnelle
+
+Installer le backend sur le Raspberry Pi avec `pip install -r requirements-yolo.txt`, puis déposer un modèle nano compatible à `/home/solufi/models/yolo11n.pt` (ou définir `PICAR_YOLO_MODEL`). Avec `PICAR_PERSON_DETECTOR=auto`, YOLO est utilisé s'il est disponible; sinon HOG reste le repli automatique.
+
 ## Diagnostic rapide
 
 ```bash

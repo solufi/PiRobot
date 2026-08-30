@@ -161,14 +161,30 @@ if face_detector is None:
 # Full-body person detector (HOG + linear SVM, built into OpenCV).
 # Heavier than YuNet (~50ms on Pi 5 at 320x240) so we run it less often.
 PERSON_DETECT_EVERY_N = int(os.environ.get("PICAR_PERSON_EVERY_N", "5"))
+PERSON_DETECTOR = os.environ.get("PICAR_PERSON_DETECTOR", "auto").lower()
+yolo_detector = None
+YOLO_DEVICE = os.environ.get("PICAR_YOLO_DEVICE", "cpu")
+YOLO_CONFIDENCE = float(os.environ.get("PICAR_YOLO_CONFIDENCE", "0.35"))
+YOLO_MODEL = os.environ.get("PICAR_YOLO_MODEL", "/home/solufi/models/yolo11n.pt")
+if PERSON_DETECTOR in {"auto", "yolo"} and os.path.isfile(YOLO_MODEL):
+    try:
+        from ultralytics import YOLO
+        yolo_detector = YOLO(YOLO_MODEL)
+        log.info("YOLO person detector loaded (%s, device=%s)", YOLO_MODEL, YOLO_DEVICE)
+    except Exception:
+        log.exception("YOLO init failed; falling back to HOG")
+elif PERSON_DETECTOR == "yolo":
+    log.warning("YOLO requested but model not found at %s; falling back to HOG", YOLO_MODEL)
+
 person_detector = None
-try:
-    person_detector = cv2.HOGDescriptor()
-    person_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-    log.info("HOG person detector loaded")
-except Exception:
-    log.exception("HOG person detector init failed")
-    person_detector = None
+if yolo_detector is None:
+    try:
+        person_detector = cv2.HOGDescriptor()
+        person_detector.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
+        log.info("HOG person detector loaded")
+    except Exception:
+        log.exception("HOG person detector init failed")
+        person_detector = None
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -301,6 +317,34 @@ def detect_faces(frame_rgb):
 
 def detect_persons(frame_rgb):
     """Return list of (x,y,w,h,score) of full-body persons in CAM_SIZE coords."""
+    if yolo_detector is not None:
+        try:
+            results = yolo_detector.predict(
+                frame_rgb,
+                imgsz=DETECT_SIZE[0],
+                conf=YOLO_CONFIDENCE,
+                classes=[0],
+                device=YOLO_DEVICE,
+                verbose=False,
+            )
+            out = []
+            for result in results:
+                if result.boxes is None:
+                    continue
+                for box, score in zip(
+                    result.boxes.xyxy.tolist(), result.boxes.conf.tolist()
+                ):
+                    x1, y1, x2, y2 = box
+                    out.append((
+                        int(x1),
+                        int(y1),
+                        int(x2 - x1),
+                        int(y2 - y1),
+                        float(score),
+                    ))
+            return out
+        except Exception:
+            log.exception("YOLO detection failed; using HOG for this frame")
     if person_detector is None:
         return []
     small = cv2.resize(frame_rgb, DETECT_SIZE)
