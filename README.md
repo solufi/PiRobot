@@ -64,6 +64,10 @@ curl -u "$PICAR_USER:$PICAR_PASS" -X DELETE \
   http://192.168.2.181:5000/face_profiles
 ```
 
+Depuis l’interface, ouvrez **Paramètres**, saisissez un prénom puis cliquez sur
+**ENREGISTRER PAR CAMÉRA**. Le robot prend jusqu’à sept captures et valide au moins cinq
+captures stables avant d’enregistrer l’empreinte moyenne.
+
 Quand des profils existent, le suivi utilise uniquement un visage reconnu; sinon il refuse
 le suivi. Sans modèle SFace, le robot conserve son fonctionnement précédent.
 

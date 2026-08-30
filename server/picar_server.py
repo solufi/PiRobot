@@ -1363,6 +1363,11 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <input id="volume" type="range" min="0" max="100" value="100">
   <label>🔊 Boost (gain logiciel): <span class="value" id="boostValue">150</span>%</label>
   <input id="boost" type="range" min="50" max="300" value="150">
+  <label>Profil visage local</label>
+  <input id="faceName" type="text" placeholder="Prénom" maxlength="40"
+         style="width:60%;padding:6px;border-radius:6px;border:none;background:#222;color:#eee;">
+  <button class="small-btn" id="faceCapture">ENREGISTRER PAR CAMÉRA</button>
+  <span id="faceCaptureStatus" style="font-size:12px;"></span>
   <br><br>
   <button class="small-btn" data-once="center">CENTER</button>
   <button class="small-btn" data-once="cam_center">CAM CENTER</button>
@@ -1669,6 +1674,21 @@ bindRange("tilt","tilt");
     }, 120);
   });
 })();
+document.getElementById("faceCapture").addEventListener("click", async () => {
+  const name = document.getElementById("faceName").value.trim();
+  const status = document.getElementById("faceCaptureStatus");
+  if (!name) { status.innerText = "Prénom requis"; return; }
+  status.innerText = "Regardez la caméra...";
+  const form = new FormData();
+  form.append("name", name);
+  try {
+    const response = await fetch("/face_profiles/capture", {method:"POST", body:form});
+    const data = await response.json();
+    status.innerText = data.ok ? `Enregistré (${data.captures} captures)` : (data.error || "Échec");
+  } catch (e) {
+    status.innerText = "Robot indisponible";
+  }
+});
 
 function press(action){ wsSend({type:"cmd", action: action}); }
 function release(action){ wsSend({type:"cmd", action: "release_" + action}); }
@@ -1783,6 +1803,47 @@ def face_profiles_route():
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, "profiles": face_identity.profiles()})
+
+
+@app.route("/face_profiles/capture", methods=["POST"])
+@requires_auth
+def face_profiles_capture_route():
+    if not face_identity.available:
+        return jsonify({"ok": False, "error": "modèle SFace indisponible"}), 503
+    name = request.form.get("name", "").strip()
+    if not name:
+        return jsonify({"ok": False, "error": "nom manquant"}), 400
+
+    features = []
+    for _ in range(7):
+        with frame_lock:
+            frame = latest_frame.copy() if latest_frame is not None else None
+        if frame is not None:
+            details = detect_face_details(frame)
+            if len(details) == 1:
+                feature = face_identity.feature(frame, details[0])
+                if feature is not None:
+                    features.append(np.asarray(feature, dtype=np.float32))
+        if len(features) >= 5:
+            break
+        time.sleep(0.25)
+
+    if len(features) < 5:
+        return jsonify({
+            "ok": False,
+            "error": "visage instable: gardez un seul visage devant la caméra",
+        }), 400
+    average = np.mean(features, axis=0)
+    average /= max(float(np.linalg.norm(average)), 1e-12)
+    try:
+        face_identity.enroll(name, average.tolist())
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({
+        "ok": True,
+        "profiles": face_identity.profiles(),
+        "captures": len(features),
+    })
 
 
 @app.route("/settings", methods=["POST"])
