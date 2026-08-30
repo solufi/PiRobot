@@ -19,7 +19,9 @@ scripts/deploy.sh             # scp + restart + healthcheck
 ./scripts/deploy.sh user@host       # autre cible
 ```
 
-Le script copie l'app, met à jour l'unit systemd, supprime l'ancien drop-in, recharge et redémarre. Il vérifie ensuite que le service est `active` et que `/healthz` répond.
+Le script copie l'app, télécharge automatiquement les modèles YuNet/SFace s'ils manquent,
+met à jour l'unit systemd, supprime l'ancien drop-in, recharge et redémarre. Il vérifie ensuite
+que le service est `active` et que `/healthz` répond.
 
 ## Configuration runtime
 
