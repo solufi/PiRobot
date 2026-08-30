@@ -25,6 +25,10 @@ que le service est `active` et que `/healthz` répond.
 Il installe aussi Avahi et configure `robot.local` par défaut; pour un autre nom:
 `PICAR_MDNS_NAME=jamal ./scripts/deploy.sh user@host`. Les clients doivent être sur le même
 réseau et autoriser mDNS; sinon utiliser l'adresse IP.
+Après ce premier déploiement, le bouton **METTRE À JOUR** dans **Paramètres** télécharge la
+branche `main` depuis GitHub, vérifie la syntaxe, remplace uniquement les fichiers applicatifs
+et redémarre automatiquement le service. En cas d’échec du healthcheck, la version précédente
+est restaurée; les modèles, profils et `/etc/picar.env` ne sont pas modifiés.
 
 ## Configuration runtime
 

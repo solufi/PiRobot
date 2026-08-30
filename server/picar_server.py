@@ -87,6 +87,7 @@ PI_MIC_DEVICE = os.environ.get("PICAR_MIC", "plughw:CARD=Device,DEV=0")
 PI_MIC_SECONDS = float(os.environ.get("PICAR_MIC_SECONDS", "5"))
 TTS_DIR = pathlib.Path(tempfile.gettempdir()) / "picar_tts"
 TTS_DIR.mkdir(exist_ok=True)
+UPDATE_STATUS = pathlib.Path("/home/solufi/update-status.json")
 tts_play_lock = threading.Lock()
 mic_lock = threading.Lock()  # serialize arecord usage between /voice/pi and listen_loop
 
@@ -1372,6 +1373,9 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <span id="faceCaptureStatus" style="font-size:12px;"></span>
   <label>Seuil de reconnaissance: <span class="value" id="faceThresholdValue">0.363</span></label>
   <input id="faceThreshold" type="range" min="0.200" max="0.800" step="0.001" value="0.363">
+  <label>Mise à jour du robot</label>
+  <button class="small-btn" id="updateBtn">METTRE À JOUR</button>
+  <span id="updateStatus" style="font-size:12px;"></span>
   <br><br>
   <button class="small-btn" data-once="center">CENTER</button>
   <button class="small-btn" data-once="cam_center">CAM CENTER</button>
@@ -1719,6 +1723,32 @@ document.getElementById("faceThreshold").addEventListener("change", async (event
     body: JSON.stringify({threshold:threshold})
   });
 });
+document.getElementById("updateBtn").addEventListener("click", async () => {
+  const button = document.getElementById("updateBtn");
+  const status = document.getElementById("updateStatus");
+  button.disabled = true;
+  status.innerText = "Mise à jour en cours…";
+  try {
+    const response = await fetch("/update", {method:"POST"});
+    const data = await response.json();
+    status.innerText = data.message || data.error || "Demande envoyée";
+    if (response.ok) {
+      const poll = setInterval(async () => {
+        try {
+          const current = await (await fetch("/update")).json();
+          status.innerText = current.message || current.state;
+          if (["success", "error"].includes(current.state)) clearInterval(poll);
+        } catch (e) {
+          clearInterval(poll);
+        }
+      }, 2000);
+    }
+  } catch (e) {
+    status.innerText = "Impossible de lancer la mise à jour";
+  } finally {
+    setTimeout(() => { button.disabled = false; }, 3000);
+  }
+});
 
 function press(action){ wsSend({type:"cmd", action: action}); }
 function release(action){ wsSend({type:"cmd", action: "release_" + action}); }
@@ -1889,6 +1919,28 @@ def face_settings_route():
             settings["face_threshold"] = threshold
         return jsonify({"ok": True, "threshold": threshold})
     return jsonify({"threshold": face_identity.threshold})
+
+
+@app.route("/update", methods=["GET", "POST"])
+@requires_auth
+def update_route():
+    if request.method == "GET":
+        try:
+            return jsonify(json.loads(UPDATE_STATUS.read_text()))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return jsonify({"state": "idle", "message": "Aucune mise à jour exécutée"})
+    try:
+        subprocess.Popen(
+            ["/usr/local/sbin/picar-update"],
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        return jsonify({
+            "ok": False,
+            "error": "mise à jour indisponible: lancez deploy.sh d'abord",
+        }), 503
+    return jsonify({"ok": True, "message": "Mise à jour démarrée"}), 202
 
 
 @app.route("/settings", methods=["POST"])
