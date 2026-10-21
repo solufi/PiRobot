@@ -152,17 +152,79 @@ jpeg_lock = threading.Lock()
 jpeg_seq = -1
 latest_jpeg = None
 
-CAM_SIZE = (640, 480)
+VIDEO_PRESETS = {
+    "640x480": (640, 480, 20),
+    "1280x720": (1280, 720, 15),
+    "1920x1080": (1920, 1080, 10),
+}
+VIDEO_SETTINGS = pathlib.Path(os.environ.get(
+    "PICAR_VIDEO_SETTINGS", "/home/solufi/models/video_settings.json"
+))
+video_restart_pending = False
+
+
+def load_video_resolution():
+    try:
+        resolution = json.loads(VIDEO_SETTINGS.read_text()).get("resolution")
+        if resolution in VIDEO_PRESETS:
+            return resolution
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return "640x480"
+
+
+def save_video_resolution(resolution):
+    if resolution not in VIDEO_PRESETS:
+        raise ValueError("résolution invalide")
+    VIDEO_SETTINGS.parent.mkdir(parents=True, exist_ok=True)
+    temp = VIDEO_SETTINGS.with_name(VIDEO_SETTINGS.name + ".tmp")
+    temp.write_text(json.dumps({"resolution": resolution}))
+    temp.chmod(0o600)
+    temp.replace(VIDEO_SETTINGS)
+
+
+video_resolution = load_video_resolution()
+CAM_SIZE = VIDEO_PRESETS[video_resolution][:2]
+settings["video_resolution"] = video_resolution
+settings["video_error"] = ""
 JPEG_QUALITY = int(os.environ.get("PICAR_JPEG_QUALITY", "70"))
 TRACKING_HZ = float(os.environ.get("PICAR_TRACKING_HZ", "20"))
 # Detect at lower resolution for speed (YuNet on 320x240 is ~5ms on Pi 5).
-DETECT_SIZE = (320, 240)
+
+def create_video_camera(resolution):
+    for candidate in dict.fromkeys((resolution, "640x480")):
+        instance = Picamera2()
+        try:
+            instance.configure(instance.create_video_configuration(
+                main={"size": VIDEO_PRESETS[candidate][:2]},
+                controls={"FrameRate": VIDEO_PRESETS[candidate][2]},
+            ))
+            instance.start()
+            error = "" if candidate == resolution else "Résolution indisponible; retour à 640 × 480."
+            return instance, candidate, error
+        except Exception:
+            try:
+                instance.close()
+            except Exception:
+                pass
+            if candidate == "640x480":
+                raise
+            log.exception("selected camera resolution failed; falling back to 640x480")
+
+
+requested_resolution = video_resolution
+camera, video_resolution, settings["video_error"] = create_video_camera(video_resolution)
+CAM_SIZE = VIDEO_PRESETS[video_resolution][:2]
+settings["video_resolution"] = video_resolution
+if requested_resolution != video_resolution:
+    try:
+        save_video_resolution(video_resolution)
+    except OSError:
+        log.exception("could not persist fallback video resolution")
+
+DETECT_SIZE = (320, round(CAM_SIZE[1] * 320 / CAM_SIZE[0]))
 DETECT_SCALE_X = CAM_SIZE[0] / DETECT_SIZE[0]
 DETECT_SCALE_Y = CAM_SIZE[1] / DETECT_SIZE[1]
-
-camera = Picamera2()
-camera.configure(camera.create_video_configuration(main={"size": CAM_SIZE}))
-camera.start()
 
 # YuNet face detector (fast DNN, ~5ms on Pi 5 at 320x240).
 YUNET_MODEL = os.environ.get(
@@ -222,6 +284,15 @@ if yolo_detector is None:
 # ---------------------------------------------------------------------------
 def clamp(v, mi, ma):
     return max(mi, min(ma, v))
+
+
+def tracking_geometry(x, y, width, height):
+    """Keep tracking gains and distance thresholds in the original 640x480 space."""
+    return (
+        (x + width / 2 - CAM_SIZE[0] / 2) * 640 / CAM_SIZE[0],
+        (y + height / 2 - CAM_SIZE[1] / 2) * 480 / CAM_SIZE[1],
+        width * 640 / CAM_SIZE[0],
+    )
 
 
 def guarded_drive(action, speed=0, turn=0, *, follow=False):
@@ -382,9 +453,12 @@ def detect_faces(frame_rgb):
             out.append((int(x), int(y), int(w), int(h), score))
         return out
     # Haar fallback
-    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-    faces = face_cascade.detectMultiScale(gray, 1.2, 4, minSize=(60, 60))
-    return [(int(x), int(y), int(w), int(h), 1.0) for (x, y, w, h) in faces]
+    small = cv2.resize(frame_rgb, DETECT_SIZE)
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.2, 4, minSize=(30, 30))
+    return [(int(x * DETECT_SCALE_X), int(y * DETECT_SCALE_Y),
+             int(w * DETECT_SCALE_X), int(h * DETECT_SCALE_Y), 1.0)
+            for (x, y, w, h) in faces]
 
 
 def detect_face_details(frame_rgb):
@@ -463,7 +537,6 @@ def detect_persons(frame_rgb):
 def tracking_loop():
     global latest_overlay
     period = 1.0 / max(TRACKING_HZ, 1.0)
-    cx_target, cy_target = CAM_SIZE[0] // 2, CAM_SIZE[1] // 2
     # Proportional gains: how aggressively to chase the face.
     KP_PAN = 0.05      # deg per pixel of horizontal error
     KP_TILT = 0.05
@@ -586,17 +659,16 @@ def tracking_loop():
                 latest_overlay = None
             else:
                 x, y, w, h, score = max(targets, key=lambda f: f[2] * f[3])
-                cx, cy = x + w // 2, y + h // 2
-                raw_dx, raw_dy = cx - cx_target, cy - cy_target
+                raw_dx, raw_dy, reference_w = tracking_geometry(x, y, w, h)
 
                 # EMA smoothing of target geometry (reduces frame-to-frame jitter)
                 if smooth["dx"] is None:
-                    smooth["dx"], smooth["dy"], smooth["w"] = raw_dx, raw_dy, w
+                    smooth["dx"], smooth["dy"], smooth["w"] = raw_dx, raw_dy, reference_w
                 else:
                     a = EMA_ALPHA
                     smooth["dx"] = a * raw_dx + (1 - a) * smooth["dx"]
                     smooth["dy"] = a * raw_dy + (1 - a) * smooth["dy"]
-                    smooth["w"]  = a * w      + (1 - a) * smooth["w"]
+                    smooth["w"]  = a * reference_w + (1 - a) * smooth["w"]
                 dx = int(smooth["dx"])
                 dy = int(smooth["dy"])
                 ws = int(smooth["w"])
@@ -788,8 +860,11 @@ def mjpeg_gen():
     last_seq = -1
     while True:
         with frame_condition:
-            frame_condition.wait_for(lambda: frame_seq != last_seq, timeout=1.0)
-            if frame_seq == last_seq:
+            frame_condition.wait_for(
+                lambda: latest_frame is not None and frame_seq != last_seq,
+                timeout=1.0,
+            )
+            if latest_frame is None or frame_seq == last_seq:
                 continue
         # One conversion/encode per captured frame, shared by all viewers.
         with jpeg_lock:
@@ -799,6 +874,7 @@ def mjpeg_gen():
                          else latest_frame)
             if frame is None:
                 continue
+            last_seq = seq
             if jpeg_seq != seq:
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 ok, buf = cv2.imencode(".jpg", bgr, encode_params)
@@ -1384,7 +1460,7 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
 <h2>PiCar-X</h2>
 
 <div class="camera-box">
-  <img src="/video_feed" alt="camera">
+  <img id="videoStream" src="/video_feed" alt="camera">
   <button class="fs-btn" id="fsBtn" title="Plein écran" onclick="toggleFullscreen()">⛶</button>
 </div>
 
@@ -1395,9 +1471,7 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <button class="small-btn" onclick="toggleSettings()">PARAMÈTRES</button>
   <button class="small-btn" onclick="toggleCali()">🛠️ CALIBRER</button>
   <button class="small-btn" onclick="toggleChat()">🤖 CHAT</button>
-  <button class="small-btn" id="updateBtn">↻ METTRE À JOUR</button>
 </div>
-<p id="updateStatus" role="status" aria-live="polite" style="font-size:13px;min-height:1em;"></p>
 <p>Détection: <span class="value" id="faceStatus">---</span>
   · Identité: <span class="value" id="recognizedStatus">---</span></p>
 <p class="info-bar" style="font-size:13px;">
@@ -1417,6 +1491,15 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
 
 <div class="panel" id="settingsPanel" style="display:none;">
   <h3>Réglages</h3>
+  <label for="videoResolution">Résolution vidéo</label>
+  <select id="videoResolution" style="width:100%;padding:8px;background:#222;color:#eee;border-radius:6px;">
+    <option value="640x480">640 × 480 — fluide (20 images/s)</option>
+    <option value="1280x720">HD 1280 × 720 (15 images/s)</option>
+    <option value="1920x1080">Full HD 1920 × 1080 (10 images/s)</option>
+  </select>
+  <p style="font-size:12px;color:#aaa;">Plus de détails en HD, avec davantage de délai en Wi-Fi. Le choix est mémorisé.</p>
+  <button class="small-btn" id="videoApply">APPLIQUER LA RÉSOLUTION</button>
+  <p id="videoStatus" role="status" aria-live="polite" style="font-size:12px;"></p>
   <label>Vitesse: <span class="value" id="speedValue">40</span></label>
   <input id="speed" type="range" min="10" max="100" value="40">
   <label>Angle virage: <span class="value" id="turnValue">30</span></label>
@@ -1436,6 +1519,9 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <span id="faceCaptureStatus" style="font-size:12px;"></span>
   <label>Seuil de reconnaissance: <span class="value" id="faceThresholdValue">0.363</span></label>
   <input id="faceThreshold" type="range" min="0.200" max="0.800" step="0.001" value="0.363">
+  <label>Mise à jour depuis GitHub</label>
+  <button class="small-btn" id="updateBtn">↻ METTRE À JOUR</button>
+  <p id="updateStatus" role="status" aria-live="polite" style="font-size:12px;"></p>
   <br><br>
   <button class="small-btn" data-once="center">CENTER</button>
   <button class="small-btn" data-once="cam_center">CAM CENTER</button>
@@ -1471,10 +1557,38 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
 const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
 let ws = null, wsReady = false, reconnectDelay = 500;
 const wsBadge = document.getElementById("wsStatus");
+let videoRetryTimer = null;
+function reconnectVideo(){
+  clearTimeout(videoRetryTimer);
+  document.getElementById("videoStream").src = "/video_feed?t=" + Date.now();
+}
+document.getElementById("videoStream").addEventListener("error", () => {
+  clearTimeout(videoRetryTimer);
+  videoRetryTimer = setTimeout(reconnectVideo, 1500);
+});
+async function refreshVideoSettings(){
+  try {
+    const response = await fetchWithTimeout("/video_settings", {cache:"no-store"});
+    if (!response.ok) return;
+    const data = await response.json();
+    document.getElementById("videoResolution").value = data.resolution;
+    document.getElementById("videoStatus").innerText = data.error || "";
+  } catch(e) {}
+}
+async function fetchWithTimeout(url, options={}){
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try { return await fetch(url, {...options, signal:controller.signal}); }
+  finally { clearTimeout(timer); }
+}
 
 function connect(){
   ws = new WebSocket(wsUrl);
-  ws.onopen = () => { wsReady = true; reconnectDelay = 500; wsBadge.textContent = "WS ✓"; wsBadge.className="ws ok"; };
+  ws.onopen = () => {
+    wsReady = true; reconnectDelay = 500; wsBadge.textContent = "WS ✓"; wsBadge.className="ws ok";
+    reconnectVideo();
+    refreshVideoSettings();
+  };
   ws.onclose = () => { wsReady = false; wsBadge.textContent = "WS …"; wsBadge.className="ws bad"; setTimeout(connect, reconnectDelay); reconnectDelay = Math.min(reconnectDelay*2, 5000); };
   ws.onerror = () => { try { ws.close(); } catch(e){} };
   ws.onmessage = ev => {
@@ -1784,6 +1898,61 @@ document.getElementById("faceThreshold").addEventListener("change", async (event
     body: JSON.stringify({threshold:threshold})
   });
 });
+document.getElementById("videoApply").addEventListener("click", async () => {
+  const select = document.getElementById("videoResolution");
+  const button = document.getElementById("videoApply");
+  const status = document.getElementById("videoStatus");
+  const resolution = select.value;
+  if (button.disabled) return;
+  button.disabled = true;
+  select.disabled = true;
+  const reset = () => { button.disabled = false; select.disabled = false; };
+  status.innerText = "Application de la résolution…";
+  try {
+    const response = await fetchWithTimeout("/video_settings", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({resolution:resolution})
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Réglage indisponible");
+    if (!data.restarting) {
+      status.innerText = "Cette résolution est déjà active.";
+      reset();
+      return;
+    }
+    status.innerText = "Redémarrage de la vidéo… Reconnexion automatique.";
+    const deadline = Date.now() + 90000;
+    const poll = async () => {
+      if (Date.now() >= deadline) {
+        status.innerText = "Le robot tarde à redémarrer. Recharge la page pour vérifier.";
+        reset();
+        return;
+      }
+      try {
+        const response = await fetchWithTimeout("/video_settings", {cache:"no-store"});
+        if (response.ok) {
+          const current = await response.json();
+          if (current.resolution === resolution) {
+            status.innerText = "Résolution appliquée. Rechargement…";
+            setTimeout(() => location.reload(), 500);
+            return;
+          }
+          if (current.error) {
+            status.innerText = current.error;
+            select.value = current.resolution;
+            reset();
+            return;
+          }
+        }
+      } catch(e) {}
+      setTimeout(poll, 1500);
+    };
+    setTimeout(poll, 2500);
+  } catch(e) {
+    status.innerText = e.message || "Impossible de changer la résolution";
+    reset();
+  }
+});
 document.getElementById("updateBtn").addEventListener("click", async () => {
   const button = document.getElementById("updateBtn");
   const status = document.getElementById("updateStatus");
@@ -1796,7 +1965,7 @@ document.getElementById("updateBtn").addEventListener("click", async () => {
     button.innerText = "↻ METTRE À JOUR";
   };
   try {
-    const response = await fetch("/update", {method:"POST"});
+    const response = await fetchWithTimeout("/update", {method:"POST"});
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "Mise à jour indisponible");
     status.innerText = "Téléchargement depuis GitHub…";
@@ -1809,7 +1978,7 @@ document.getElementById("updateBtn").addEventListener("click", async () => {
         return;
       }
       try {
-        const response = await fetch("/update", {cache:"no-store"});
+        const response = await fetchWithTimeout("/update", {cache:"no-store"});
         if (!response.ok) throw new Error("reconnexion");
         const current = await response.json();
         status.innerText = current.message || "Mise à jour en cours…";
@@ -2039,6 +2208,42 @@ def update_route():
             "error": "mise à jour indisponible: lancez deploy.sh d'abord",
         }), 503
     return jsonify({"ok": True, "message": "Mise à jour démarrée"}), 202
+
+
+def restart_after_video_change():
+    time.sleep(0.75)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+@app.route("/video_settings", methods=["GET", "POST"])
+@requires_auth
+def video_settings_route():
+    global video_restart_pending
+    if request.method == "GET":
+        return jsonify({
+            "resolution": settings["video_resolution"],
+            "fps": VIDEO_PRESETS[settings["video_resolution"]][2],
+            "error": settings["video_error"],
+        })
+    data = request.get_json(silent=True) or {}
+    resolution = data.get("resolution") if isinstance(data, dict) else None
+    if not isinstance(resolution, str) or resolution not in VIDEO_PRESETS:
+        return jsonify({"ok": False, "error": "résolution invalide"}), 400
+    with state_lock:
+        if video_restart_pending:
+            return jsonify({"ok": False, "error": "redémarrage déjà en cours"}), 409
+        if resolution == settings["video_resolution"]:
+            return jsonify({"ok": True, "restarting": False})
+        try:
+            save_video_resolution(resolution)
+        except OSError:
+            log.exception("could not save video resolution")
+            return jsonify({"ok": False, "error": "impossible de mémoriser la résolution"}), 500
+        stop_all()
+        video_restart_pending = True
+        threading.Thread(target=restart_after_video_change, daemon=True,
+                         name="video-restart").start()
+    return jsonify({"ok": True, "restarting": True}), 202
 
 
 @app.route("/settings", methods=["POST"])

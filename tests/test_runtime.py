@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -48,6 +49,9 @@ class RuntimeTests(unittest.TestCase):
         self.c.last_motor_command = None
         self.c.last_sensor_at = time.monotonic()
         self.c.motor_action = "stop"
+        self.c.video_restart_pending = False
+        self.c.settings.update(video_resolution="640x480", video_error="")
+        self.c.CAM_SIZE = (640, 480)
 
     def test_stop_prevents_inflight_tracker_from_restarting_motors(self):
         self.c.stop_all()
@@ -159,6 +163,90 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.c.cv2.imencode.call_count, 2)
         first.close()
         second.close()
+
+    def test_tracking_geometry_is_stable_across_resolutions(self):
+        for size in ((640, 480), (1280, 720), (1920, 1080)):
+            with self.subTest(size=size):
+                self.c.CAM_SIZE = size
+                sx, sy = size[0] / 640, size[1] / 480
+                geometry = self.c.tracking_geometry(400*sx, 120*sy, 80*sx, 80*sy)
+                self.assertEqual(geometry, (120, -80, 80))
+
+    def test_video_resolution_survives_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "models/video_settings.json"
+            with patch.object(self.c, "VIDEO_SETTINGS", path):
+                self.c.save_video_resolution("1280x720")
+                self.assertEqual(self.c.load_video_resolution(), "1280x720")
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_corrupt_video_settings_use_standard_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "video_settings.json"
+            with patch.object(self.c, "VIDEO_SETTINGS", path):
+                for contents in ('{bad', '[]', '{"resolution": []}', '{"resolution": "8k"}'):
+                    path.write_text(contents)
+                    self.assertEqual(self.c.load_video_resolution(), "640x480")
+
+    def test_rejected_hd_mode_falls_back_and_closes_failed_camera(self):
+        first, second = MagicMock(), MagicMock()
+        first.configure.side_effect = RuntimeError("unsupported mode")
+        with patch.object(self.c, "Picamera2", side_effect=[first, second]):
+            instance, resolution, error = self.c.create_video_camera("1920x1080")
+        self.assertIs(instance, second)
+        self.assertEqual(resolution, "640x480")
+        self.assertTrue(error)
+        first.close.assert_called_once()
+        second.start.assert_called_once()
+
+    def test_standard_camera_failure_is_reported(self):
+        instance = MagicMock()
+        instance.start.side_effect = RuntimeError("camera disconnected")
+        with patch.object(self.c, "Picamera2", return_value=instance):
+            with self.assertRaisesRegex(RuntimeError, "camera disconnected"):
+                self.c.create_video_camera("640x480")
+
+    def video_request(self, data):
+        self.c.request.method = "POST"
+        self.c.request.get_json.return_value = data
+        return self.c.video_settings_route()
+
+    def test_resolution_request_stops_motors_before_restart(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(self.c, "VIDEO_SETTINGS", Path(directory) / "video.json"), \
+                patch.object(self.c, "jsonify", side_effect=lambda data: data), \
+                patch.object(threading.Thread, "start") as start:
+            result, status = self.video_request({"resolution": "1280x720"})
+            self.assertEqual(status, 202)
+            self.assertTrue(result["restarting"])
+            self.assertFalse(self.c.settings["follow_me"])
+            self.c.px.stop.assert_called_once()
+            self.assertEqual(self.c.load_video_resolution(), "1280x720")
+            start.assert_called_once()
+
+    def test_invalid_resolution_never_stops_or_restarts_robot(self):
+        with patch.object(self.c, "jsonify", side_effect=lambda data: data), \
+                patch.object(threading.Thread, "start") as start:
+            for data in ({"resolution": "8k"}, {"resolution": []}, ["1280x720"]):
+                self.assertEqual(self.video_request(data)[1], 400)
+            self.c.px.stop.assert_not_called()
+            start.assert_not_called()
+
+    def test_same_resolution_does_not_restart(self):
+        with patch.object(self.c, "jsonify", side_effect=lambda data: data), \
+                patch.object(threading.Thread, "start") as start:
+            result = self.video_request({"resolution": "640x480"})
+            self.assertFalse(result["restarting"])
+            self.c.px.stop.assert_not_called()
+            start.assert_not_called()
+
+    def test_failed_video_save_does_not_interrupt_robot(self):
+        with patch.object(self.c, "jsonify", side_effect=lambda data: data), \
+                patch.object(self.c, "save_video_resolution", side_effect=OSError("read only")), \
+                patch.object(threading.Thread, "start") as start:
+            self.assertEqual(self.video_request({"resolution": "1280x720"})[1], 500)
+            self.c.px.stop.assert_not_called()
+            start.assert_not_called()
 
 
 if __name__ == "__main__":
