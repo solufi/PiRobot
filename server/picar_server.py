@@ -1395,7 +1395,9 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <button class="small-btn" onclick="toggleSettings()">PARAMÈTRES</button>
   <button class="small-btn" onclick="toggleCali()">🛠️ CALIBRER</button>
   <button class="small-btn" onclick="toggleChat()">🤖 CHAT</button>
+  <button class="small-btn" id="updateBtn">↻ METTRE À JOUR</button>
 </div>
+<p id="updateStatus" role="status" aria-live="polite" style="font-size:13px;min-height:1em;"></p>
 <p>Détection: <span class="value" id="faceStatus">---</span>
   · Identité: <span class="value" id="recognizedStatus">---</span></p>
 <p class="info-bar" style="font-size:13px;">
@@ -1434,9 +1436,6 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   <span id="faceCaptureStatus" style="font-size:12px;"></span>
   <label>Seuil de reconnaissance: <span class="value" id="faceThresholdValue">0.363</span></label>
   <input id="faceThreshold" type="range" min="0.200" max="0.800" step="0.001" value="0.363">
-  <label>Mise à jour du robot</label>
-  <button class="small-btn" id="updateBtn">METTRE À JOUR</button>
-  <span id="updateStatus" style="font-size:12px;"></span>
   <br><br>
   <button class="small-btn" data-once="center">CENTER</button>
   <button class="small-btn" data-once="cam_center">CAM CENTER</button>
@@ -1788,27 +1787,51 @@ document.getElementById("faceThreshold").addEventListener("change", async (event
 document.getElementById("updateBtn").addEventListener("click", async () => {
   const button = document.getElementById("updateBtn");
   const status = document.getElementById("updateStatus");
+  if (button.disabled) return;
   button.disabled = true;
-  status.innerText = "Mise à jour en cours…";
+  button.innerText = "MISE À JOUR…";
+  status.innerText = "Connexion à GitHub…";
+  const resetButton = () => {
+    button.disabled = false;
+    button.innerText = "↻ METTRE À JOUR";
+  };
   try {
     const response = await fetch("/update", {method:"POST"});
     const data = await response.json();
-    status.innerText = data.message || data.error || "Demande envoyée";
-    if (response.ok) {
-      const poll = setInterval(async () => {
-        try {
-          const current = await (await fetch("/update")).json();
-          status.innerText = current.message || current.state;
-          if (["success", "error"].includes(current.state)) clearInterval(poll);
-        } catch (e) {
-          clearInterval(poll);
+    if (!response.ok) throw new Error(data.error || "Mise à jour indisponible");
+    status.innerText = "Téléchargement depuis GitHub…";
+    const deadline = Date.now() + 240000;
+    let sawRestart = false;
+    const poll = async () => {
+      if (Date.now() >= deadline) {
+        status.innerText = "Délai dépassé. Vérifie la connexion au robot avant de réessayer.";
+        resetButton();
+        return;
+      }
+      try {
+        const response = await fetch("/update", {cache:"no-store"});
+        if (!response.ok) throw new Error("reconnexion");
+        const current = await response.json();
+        status.innerText = current.message || "Mise à jour en cours…";
+        if (current.state === "success") {
+          status.innerText = "Mise à jour terminée. Rechargement de l’interface…";
+          setTimeout(() => location.reload(), 1000);
+          return;
         }
-      }, 2000);
-    }
+        if (current.state === "error") {
+          resetButton();
+          return;
+        }
+      } catch (e) {
+        sawRestart = true;
+        status.innerText = "Redémarrage du robot… Reconnexion en cours.";
+      }
+      setTimeout(poll, sawRestart ? 1000 : 2000);
+    };
+    setTimeout(poll, 2000);
   } catch (e) {
-    status.innerText = "Impossible de lancer la mise à jour";
-  } finally {
-    setTimeout(() => { button.disabled = false; }, 3000);
+    status.innerText = e.message || "Impossible de lancer la mise à jour";
+    resetButton();
   }
 });
 
@@ -1999,6 +2022,8 @@ def face_settings_route():
 def update_route():
     if request.method == "GET":
         try:
+            if UPDATE_REQUEST.exists() and UPDATE_STATUS.stat().st_mtime < UPDATE_REQUEST.stat().st_mtime:
+                return jsonify({"state": "queued", "message": "Mise à jour en attente de démarrage…"})
             return jsonify(json.loads(UPDATE_STATUS.read_text()))
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return jsonify({"state": "idle", "message": "Aucune mise à jour exécutée"})
@@ -2006,6 +2031,7 @@ def update_route():
         # A separate systemd unit survives the controller's restart.
         if not pathlib.Path("/etc/systemd/system/picar-update.path").exists():
             raise FileNotFoundError("update path unit not installed")
+        stop_all()
         UPDATE_REQUEST.write_text(uuid.uuid4().hex + "\n")
     except OSError:
         return jsonify({

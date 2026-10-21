@@ -30,10 +30,14 @@ que le service est `active` et que `/healthz` répond.
 Il installe aussi Avahi et configure `robot.local` par défaut; pour un autre nom:
 `PICAR_MDNS_NAME=jamal ./scripts/deploy.sh user@host`. Les clients doivent être sur le même
 réseau et autoriser mDNS; sinon utiliser l'adresse IP.
-Après ce premier déploiement, le bouton **METTRE À JOUR** dans **Paramètres** télécharge la
+Après ce premier déploiement, le bouton **METTRE À JOUR** sur l’écran principal télécharge la
 branche `main` depuis GitHub, vérifie la syntaxe, remplace uniquement les fichiers applicatifs
 et redémarre automatiquement le service. En cas d’échec du healthcheck, la version précédente
 est restaurée; les modèles, profils et `/etc/picar.env` ne sont pas modifiés.
+L’interface affiche la progression, attend la reconnexion après redémarrage puis
+se recharge automatiquement. Les quatre modules Python du serveur contiennent
+l’application et son interface; les unités système et le moteur de mise à jour
+s’installent avec le script de déploiement.
 La demande est exécutée par `picar-update.path` et `picar-update.service`, dans un
 processus indépendant du contrôleur. Cela évite d'interrompre la mise à jour lorsque
 le contrôleur redémarre. `PICAR_UPDATE_REF` dans `/etc/picar-update.env` permet de
