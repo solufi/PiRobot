@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REF="${1:-main}"
-ROOT="/home/solufi"
+REF="${1:-${PICAR_UPDATE_REF:-main}}"
+[[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$ ]] || exit 2
+ROOT="${PICAR_ROOT:-/home/solufi}"
 STATUS="${ROOT}/update-status.json"
 LOCK="${ROOT}/picar-update.lock"
 ARCHIVE_URL="https://github.com/solufi/PiRobot/archive/refs/heads/${REF}.tar.gz"
@@ -21,7 +22,18 @@ write_status() {
 
 tmp="$(mktemp -d)"
 backup="${ROOT}/update-backup-$(date +%s)"
+installed=false
 trap 'rm -rf "$tmp"' EXIT
+on_error() {
+  trap - ERR
+  if [ "$installed" = true ]; then
+    cp "${backup}/"{picar_server.py,gpt_brain.py,face_identity.py,task_policy.py} "$ROOT/"
+    pkill -TERM -f '[p]icar_server.py' || true
+  fi
+  write_status "error" "Échec de la mise à jour; consultez les journaux du service picar-update"
+  exit 1
+}
+trap on_error ERR
 
 write_status "downloading" "Téléchargement de la version ${REF}"
 curl --fail --location --silent --show-error --max-time 120 \
@@ -43,11 +55,18 @@ mkdir "$backup"
 for file in picar_server.py gpt_brain.py face_identity.py task_policy.py; do
   cp "${ROOT}/${file}" "${backup}/${file}"
 done
+installed=true
 cp "${source_dir}/server/"{picar_server.py,gpt_brain.py,face_identity.py,task_policy.py} "$ROOT/"
 
+previous_pid="$(systemctl show picar.service -p MainPID --value)"
 pkill -TERM -f '[p]icar_server.py' || true
 healthy=false
 for _ in $(seq 1 30); do
+  current_pid="$(systemctl show picar.service -p MainPID --value)"
+  if [ "$current_pid" = 0 ] || [ "$current_pid" = "$previous_pid" ]; then
+    sleep 1
+    continue
+  fi
   if curl --fail --silent --show-error --max-time 2 \
       http://127.0.0.1:5000/healthz >/dev/null; then
     healthy=true

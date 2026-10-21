@@ -20,12 +20,14 @@ echo "==> Deploying to ${HOST}"
 # 1) App
 scp "${ROOT}/server/picar_server.py" "${HOST}:/home/solufi/picar_server.py"
 scp "${ROOT}/server/gpt_brain.py"    "${HOST}:/home/solufi/gpt_brain.py"
+scp "${ROOT}/server/task_policy.py" "${HOST}:/home/solufi/task_policy.py"
 scp "${ROOT}/server/face_identity.py" "${HOST}:/home/solufi/face_identity.py"
 scp "${ROOT}/scripts/update.sh" "${HOST}:/tmp/picar-update"
 
 # 2) Systemd unit (needs sudo on the Pi)
-scp "${ROOT}/systemd/picar.service" "${HOST}:/tmp/picar.service"
+scp "${ROOT}/systemd/picar.service" "${ROOT}/systemd/picar-update.service" "${ROOT}/systemd/picar-update.path" "${HOST}:/tmp/"
 ssh "${HOST}" '
+  set -eu
   # Ensure mpg123 is installed for MP3 TTS playback
   command -v mpg123 >/dev/null 2>&1 || sudo apt-get install -y -q mpg123
   command -v avahi-daemon >/dev/null 2>&1 || sudo apt-get install -y -q avahi-daemon
@@ -35,12 +37,11 @@ ssh "${HOST}" '
   command -v pkill >/dev/null 2>&1 || sudo apt-get install -y -q procps
   sudo systemctl enable --now avahi-daemon
   sudo hostnamectl set-hostname '"${MDNS_NAME}"'
-  sudo install -m 0644 /tmp/picar.service /etc/systemd/system/picar.service
+  sudo install -m 0644 /tmp/picar.service /tmp/picar-update.service /tmp/picar-update.path /etc/systemd/system/
   sudo install -o root -g root -m 0755 /tmp/picar-update /usr/local/sbin/picar-update
   rm -f /tmp/picar-update
   rm -f /tmp/picar.service
-  # Clean obsolete drop-in (now baked into the unit)
-  sudo rm -rf /etc/systemd/system/picar.service.d
+  # Preserve site-specific systemd overrides.
   # Ensure /etc/picar.env exists (empty is fine — auth disabled)
   [ -f /etc/picar.env ] || (echo "# PiCar-X env (see .env.example)" | sudo tee /etc/picar.env >/dev/null && sudo chmod 600 /etc/picar.env)
   if ! sudo grep -q "^PICAR_VOLUME_BOOST=" /etc/picar.env; then
@@ -61,6 +62,7 @@ ssh "${HOST}" '
   chmod 600 /home/solufi/models/face_profiles.json
   sudo systemctl daemon-reload
   sudo systemctl reset-failed picar.service || true
+  sudo systemctl enable --now picar-update.path
   sudo systemctl enable picar.service
   sudo systemctl restart picar.service
   sleep 4
