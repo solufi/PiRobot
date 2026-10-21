@@ -137,7 +137,16 @@ Si le mode HD échoue au démarrage, il revient à 640×480 et l’indique dans 
 
 La détection travaille toujours sur une petite image qui conserve les proportions.
 Les erreurs de position et la taille de cible sont ramenées à l’échelle de référence
-pour conserver les seuils du suivi quand la résolution change. Le navigateur
-rouvre le flux MJPEG lorsque la connexion aux commandes revient et réessaie après
-une erreur de chargement vidéo. Les modes HD augmentent le débit réseau et la charge
+pour conserver les seuils du suivi quand la résolution change. Le navigateur renouvelle des images JPEG à réponses courtes pour laisser les connexions
+HTTP disponibles au chat et aux commandes. Un délai maximal de chargement relance
+la vidéo si une image ne répond plus. Le flux MJPEG reste disponible pour les
+clients externes; les deux chemins partagent le même encodage. Les modes HD augmentent le débit réseau et la charge
 d’encodage; ils restent à vérifier sur le robot après installation.
+
+## Commandes manuelles de la caméra
+
+Les curseurs pan/tilt envoient des commandes caméra distinctes de la vitesse et
+du virage, avec limitation du débit pendant le glissement. Un repli HTTP les
+maintient utilisables si le WebSocket se déconnecte. Une orientation manuelle
+désactive le suivi du visage; si le robot suivait une personne, ses moteurs
+s’arrêtent avant l’orientation pour éviter les commandes contradictoires.
