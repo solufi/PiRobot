@@ -7,6 +7,8 @@ Architecture:
 - WebSocket /ws handles control events (drive, settings, camera, tracking, stop).
 - HTTP POST endpoints kept as fallback for the legacy UI.
 """
+import signal
+import getpass
 import os, base64, functools, logging, threading, time, json, subprocess, tempfile, uuid, pathlib, math
 
 from flask import Flask, render_template_string, request, jsonify, Response, send_file, abort
@@ -34,6 +36,11 @@ sock = Sock(app)
 app.config["MAX_CONTENT_LENGTH"] = int(
     os.environ.get("PICAR_MAX_UPLOAD_BYTES", str(8 * 1024 * 1024))
 )
+# SunFounder calls os.getlogin() during construction; systemd has no login TTY.
+try:
+    os.getlogin()
+except OSError:
+    os.getlogin = getpass.getuser
 px = Picarx()
 
 AUTH_USER = os.environ.get("PICAR_USER")
@@ -67,7 +74,9 @@ settings = {
     "distance_cm": -1.0,
     "grayscale": [0, 0, 0],
     "obstacle": False,
-    "cliff": False,
+    "cliff": True,
+    "distance_valid": False,
+    "sensor_error": "Capteurs en cours de démarrage",
     # Safety: auto-stop on obstacle / cliff
     "safety": True,
     # Continuous listening with wake word
@@ -88,6 +97,7 @@ PI_MIC_SECONDS = float(os.environ.get("PICAR_MIC_SECONDS", "5"))
 TTS_DIR = pathlib.Path(tempfile.gettempdir()) / "picar_tts"
 TTS_DIR.mkdir(exist_ok=True)
 UPDATE_STATUS = pathlib.Path("/home/solufi/update-status.json")
+UPDATE_REQUEST = pathlib.Path("/home/solufi/update-request")
 tts_play_lock = threading.Lock()
 mic_lock = threading.Lock()  # serialize arecord usage between /voice/pi and listen_loop
 
@@ -125,6 +135,10 @@ control = {
 
 state_lock = threading.RLock()
 motor_lock = threading.RLock()
+last_motor_command = None
+last_motor_at = 0.0
+motor_action = "stop"
+last_sensor_at = time.monotonic()
 drive_cancel = threading.Event()
 task_lock = threading.Lock()
 last_manual_command = time.monotonic()
@@ -133,6 +147,10 @@ frame_condition = threading.Condition(frame_lock)
 latest_frame = None         # numpy RGB array (raw)
 latest_overlay = None       # numpy RGB array with face box drawn (when tracking on)
 frame_seq = 0
+last_frame_at = 0.0
+jpeg_lock = threading.Lock()
+jpeg_seq = -1
+latest_jpeg = None
 
 CAM_SIZE = (640, 480)
 JPEG_QUALITY = int(os.environ.get("PICAR_JPEG_QUALITY", "70"))
@@ -206,38 +224,68 @@ def clamp(v, mi, ma):
     return max(mi, min(ma, v))
 
 
-def update_movement():
-    with motor_lock:
-        angle = 0
-        if control["left"]:
-            angle -= settings["turn_angle"]
-        if control["right"]:
-            angle += settings["turn_angle"]
-        px.set_dir_servo_angle(angle)
-
-        moving_forward = control["forward"] and not control["backward"]
-        moving_backward = control["backward"] and not control["forward"]
+def guarded_drive(action, speed=0, turn=0, *, follow=False):
+    """Serialize sensor checks and motor writes with mode changes and STOP."""
+    global last_motor_command, last_motor_at, motor_action
+    with state_lock:
+        if follow and not (settings["tracking"] and settings["follow_me"]):
+            return False
         blocked = settings["safety"] and (
-            settings["cliff"] or (settings["obstacle"] and moving_forward)
+            settings["cliff"] or (
+                (settings["obstacle"] or not settings["distance_valid"])
+                and action == "forward"
+            ) or time.monotonic() - last_sensor_at > 0.75
         )
-        if blocked:
-            px.stop()
-        elif moving_forward:
-            px.forward(settings["speed"])
-        elif moving_backward:
-            px.backward(settings["speed"])
-        else:
-            px.stop()
+        if follow and time.monotonic() - last_frame_at > 1.0:
+            blocked = True
+        with motor_lock:
+            if blocked or action == "stop":
+                px.stop()
+                motor_action = "stop"
+                last_motor_command = None
+            else:
+                command = (action, speed, turn)
+                now = time.monotonic()
+                if follow and command == last_motor_command and now - last_motor_at < 0.4:
+                    return True
+                px.set_dir_servo_angle(turn)
+                if action == "forward":
+                    px.forward(speed)
+                elif action == "backward":
+                    px.backward(speed)
+                last_motor_command = command if follow else None
+                last_motor_at = now
+                motor_action = action
+        return not blocked
+
+
+def update_movement():
+    with state_lock:
+        turn = settings["turn_angle"] * (int(control["right"]) - int(control["left"]))
+        action = "stop"
+        if control["forward"] and not control["backward"]:
+            action = "forward"
+        elif control["backward"] and not control["forward"]:
+            action = "backward"
+        guarded_drive(action, settings["speed"], turn)
+        if action == "stop":
+            with motor_lock:
+                px.set_dir_servo_angle(turn)
 
 
 def stop_all():
+    global last_motor_command, motor_action
     drive_cancel.set()
     with state_lock:
+        settings["follow_me"] = False
+        settings["tracking"] = False
         for k in control:
             control[k] = False
-    with motor_lock:
-        px.stop()
-        px.set_dir_servo_angle(0)
+        with motor_lock:
+            px.stop()
+            motor_action = "stop"
+            last_motor_command = None
+            px.set_dir_servo_angle(0)
 
 
 def safety_blocks(direction: str) -> bool:
@@ -246,34 +294,44 @@ def safety_blocks(direction: str) -> bool:
         safety = settings["safety"]
         obstacle = settings["obstacle"]
         cliff = settings["cliff"]
+        distance_valid = settings["distance_valid"]
     if not safety:
         return False
-    return cliff or (obstacle and direction in {"forward", "left", "right"})
+    return cliff or ((obstacle or not distance_valid) and direction in {"forward", "left", "right"})
+
+
+def check_control_timeout(timeout):
+    with state_lock:
+        now = time.monotonic()
+        active = any(control.values())
+        stale = now - last_manual_command > timeout
+        camera_stale = settings["follow_me"] and now - last_frame_at > 1.0
+        sensors_stale = settings["safety"] and now - last_sensor_at > 0.75 and motor_action != "stop"
+        if (active and stale) or camera_stale or sensors_stale:
+            log.warning("control/camera/sensor timeout; stopping motors")
+            stop_all()
 
 
 def control_watchdog_loop():
     timeout = max(0.5, float(os.environ.get("PICAR_CONTROL_TIMEOUT", "1.5")))
     log.info("control watchdog started (timeout=%.1fs)", timeout)
     while True:
-        with state_lock:
-            active = any(control.values())
-            stale = time.monotonic() - last_manual_command > timeout
-        if active and stale:
-            log.warning("manual control heartbeat timed out; stopping motors")
-            stop_all()
+        check_control_timeout(timeout)
         time.sleep(0.2)
 
 
 def camera_center():
     settings["cam_pan"] = 0
     settings["cam_tilt"] = 0
-    px.set_cam_pan_angle(0)
-    px.set_cam_tilt_angle(0)
+    with motor_lock:
+        px.set_cam_pan_angle(0)
+        px.set_cam_tilt_angle(0)
 
 
 def apply_camera():
-    px.set_cam_pan_angle(settings["cam_pan"])
-    px.set_cam_tilt_angle(settings["cam_tilt"])
+    with motor_lock:
+        px.set_cam_pan_angle(settings["cam_pan"])
+        px.set_cam_tilt_angle(settings["cam_tilt"])
 
 
 def state_snapshot():
@@ -288,13 +346,14 @@ def state_snapshot():
 # Background threads
 # ---------------------------------------------------------------------------
 def capture_loop():
-    global latest_frame, frame_seq
+    global latest_frame, frame_seq, last_frame_at
     log.info("capture thread started")
     while True:
         try:
             frame = camera.capture_array()  # RGB
             with frame_lock:
                 latest_frame = frame
+                last_frame_at = time.monotonic()
                 frame_seq += 1
                 frame_condition.notify_all()
         except Exception:
@@ -420,12 +479,10 @@ def tracking_loop():
     # Exponentially-smoothed target geometry (reduces detector jitter)
     smooth = {"dx": None, "dy": None, "w": None}
     EMA_ALPHA = float(os.environ.get("PICAR_TRACK_EMA", "0.35"))
-    # Drive-state memory: don't re-issue same motor command every frame
-    last_drive = {"action": None, "speed": 0, "turn": 0, "t": 0.0}
-    DRIVE_RESEND_SEC = 0.4   # only re-send same drive after this delay
     # Larger deadband for body movement (separate from camera DEAD_PX)
     BODY_DEAD_PX = 60
     while True:
+        cycle_started = time.monotonic()
         if not settings["tracking"]:
             settings["last_face"] = "OFF"
             latest_overlay = None
@@ -445,11 +502,12 @@ def tracking_loop():
 
         try:
             t0 = time.time()
-            faces = detect_faces(frame)
+            profile_names = face_identity.profiles() if face_identity.available else []
+            # Recognition already needs landmarks from YuNet; don't detect twice.
+            faces = [] if profile_names else detect_faces(frame)
             detect_ms = (time.time() - t0) * 1000.0
             detect_count += 1
             recognized_name = None
-            profile_names = face_identity.profiles() if face_identity.available else []
             if profile_names:
                 details = detect_face_details(frame)
                 if details:
@@ -474,7 +532,7 @@ def tracking_loop():
             target_kind = "face"
             persons = []
             if not faces and not profile_names and settings["follow_me"] \
-                    and person_detector is not None \
+                    and (person_detector is not None or yolo_detector is not None) \
                     and (detect_count % PERSON_DETECT_EVERY_N == 0):
                 persons = detect_persons(frame)
                 if persons:
@@ -499,12 +557,11 @@ def tracking_loop():
                         # GRACE: keep moving toward where we last saw them.
                         last_dx = last_target["dx"]
                         turn = clamp(int(last_dx / 8), -30, 30)
-                        px.set_dir_servo_angle(turn)
                         # If we were already close, just coast slowly forward
                         if last_target["w"] > 0 and last_target["w"] > 200:
-                            px.forward(min(follow_speed, 25))
+                            guarded_drive("forward", min(follow_speed, 25), turn, follow=True)
                         else:
-                            px.forward(min(follow_speed, 40))
+                            guarded_drive("forward", min(follow_speed, 40), turn, follow=True)
                         settings["last_face"] = f"perdu({age:.1f}s) coast"
                     elif age < FOLLOW_SEARCH_SEC:
                         # SEARCH: sweep camera and pivot the body in last seen side.
@@ -517,14 +574,12 @@ def tracking_loop():
                         # Body: alternate small forward/backward turns to spin in place
                         phase = int((age - FOLLOW_GRACE_SEC) / 0.7) % 2
                         if phase == 0:
-                            px.set_dir_servo_angle(int(side * 30))
-                            px.forward(min(follow_speed, 28))
+                            guarded_drive("forward", min(follow_speed, 28), int(side * 30), follow=True)
                         else:
-                            px.set_dir_servo_angle(int(-side * 30))
-                            px.backward(min(follow_speed, 28))
+                            guarded_drive("backward", min(follow_speed, 28), int(-side * 30), follow=True)
                         settings["last_face"] = f"recherche({age:.1f}s) side={side}"
                     else:
-                        px.stop()
+                        guarded_drive("stop", follow=True)
                         settings["last_face"] = "Perdu"
                 else:
                     settings["last_face"] = "Aucun visage"
@@ -566,24 +621,8 @@ def tracking_loop():
                     "side": 1 if dx >= 0 else -1, "kind": target_kind,
                 }
 
-                # ----- Drive helper with hysteresis: suppresses repeats -----
                 def drive(action: str, speed: int = 0, turn: int = 0):
-                    nonlocal last_drive
-                    speed = int(speed); turn = int(turn)
-                    same = (last_drive["action"] == action
-                            and abs(last_drive["speed"] - speed) < 4
-                            and abs(last_drive["turn"] - turn) < 4)
-                    if same and (now - last_drive["t"]) < DRIVE_RESEND_SEC:
-                        return
-                    if action != last_drive["action"] or abs(last_drive["turn"] - turn) >= 4:
-                        px.set_dir_servo_angle(turn)
-                    if action == "forward":
-                        px.forward(speed)
-                    elif action == "backward":
-                        px.backward(speed)
-                    elif action == "stop":
-                        px.stop()
-                    last_drive = {"action": action, "speed": speed, "turn": turn, "t": now}
+                    guarded_drive(action, int(speed), int(turn), follow=True)
 
                 # Follow-me drive: smart turn + ultrasonic backup
                 if settings["follow_me"]:
@@ -628,33 +667,43 @@ def tracking_loop():
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
                 latest_overlay = overlay
         except Exception:
+            guarded_drive("stop", follow=True)
             log.exception("tracking error")
 
-        time.sleep(period)
+        time.sleep(max(0.0, period - (time.monotonic() - cycle_started)))
 
 
 def sensor_loop():
     """Read ultrasonic + grayscale at SENSOR_HZ; auto-stop on obstacle/cliff."""
+    global last_motor_command, motor_action, last_sensor_at
     log.info("sensor thread started (%.1f Hz)", SENSOR_HZ)
     period = 1.0 / SENSOR_HZ
     last_warn_t = 0.0
     dist_window: list[float] = []  # rolling median filter for ultrasonic
     DIST_WIN = 5
+    invalid_distances = 0
     while True:
         try:
             raw_dist = px.get_distance()
         except Exception:
             raw_dist = -1.0
         try:
-            gs = px.get_grayscale_data()
+            # Keep ADC register selection/read together with other I2C users.
+            with motor_lock:
+                gs = px.get_grayscale_data()
         except Exception:
             gs = [0, 0, 0]
 
         # Median filter: ultrasonic on PiCar can spike (-1, 400, etc.).
-        if isinstance(raw_dist, (int, float)) and raw_dist > 0:
+        if isinstance(raw_dist, (int, float)) and math.isfinite(raw_dist) and 0 < raw_dist <= 400:
+            invalid_distances = 0
             dist_window.append(float(raw_dist))
             if len(dist_window) > DIST_WIN:
                 dist_window.pop(0)
+        else:
+            invalid_distances += 1
+            if invalid_distances >= 3:
+                dist_window.clear()
         if dist_window:
             dist = sorted(dist_window)[len(dist_window) // 2]
         else:
@@ -662,25 +711,35 @@ def sensor_loop():
 
         obstacle = isinstance(dist, (int, float)) and 0 < dist < SAFE_STOP_CM
         # Cliff: any sensor reads below threshold (very dark = no surface)
-        cliff = any(isinstance(v, (int, float)) and v < CLIFF_THRESHOLD for v in gs)
+        grayscale_valid = (isinstance(gs, (list, tuple)) and len(gs) == 3
+                           and all(isinstance(v, (int, float)) and math.isfinite(v) for v in gs))
+        if not grayscale_valid:
+            gs = [0, 0, 0]
+        cliff = not grayscale_valid or any(v < CLIFF_THRESHOLD for v in gs)
 
         with state_lock:
             settings["distance_cm"] = float(dist) if isinstance(dist, (int, float)) else -1.0
             settings["grayscale"] = [int(v) if isinstance(v, (int, float)) else 0 for v in gs]
             settings["obstacle"] = obstacle
             settings["cliff"] = cliff
-
-        # Safety guard: if moving forward and obstacle/cliff detected, hard-stop
-        if settings["safety"] and (obstacle or cliff):
-            forward_active = (
-                control.get("forward")
-                or settings["follow_me"]  # follow_me drives forward when face is far
+            settings["distance_valid"] = bool(dist_window)
+            settings["sensor_error"] = (
+                "Capteurs au sol indisponibles" if not grayscale_valid else
+                "Capteurs au sol à zéro: vérifier alimentation et branchement" if not any(gs) else
+                "Distance indisponible" if not dist_window else ""
             )
-            if forward_active:
-                px.stop()
+            last_sensor_at = time.monotonic()
+
+        # Enforce on every motor source, including reverse and voice actions.
+        with state_lock:
+            if settings["safety"] and (cliff or ((obstacle or not dist_window) and motor_action == "forward")):
+                with motor_lock:
+                    px.stop()
+                    motor_action = "stop"
+                    last_motor_command = None
                 if time.time() - last_warn_t > 1.0:
                     log.warning("SAFETY stop: obstacle=%s cliff=%s dist=%.1f gs=%s",
-                                obstacle, cliff, dist if isinstance(dist,(int,float)) else -1, gs)
+                                obstacle, cliff, dist, gs)
                     last_warn_t = time.time()
 
         time.sleep(period)
@@ -724,30 +783,32 @@ def _request_is_authorized():
 # MJPEG stream
 # ---------------------------------------------------------------------------
 def mjpeg_gen():
+    global jpeg_seq, latest_jpeg
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
     last_seq = -1
     while True:
-        with frame_lock:
+        with frame_condition:
+            frame_condition.wait_for(lambda: frame_seq != last_seq, timeout=1.0)
             if frame_seq == last_seq:
-                frame_condition.wait(timeout=1.0)
-            if frame_seq == last_seq:
-                frame = None
-            else:
+                continue
+        # One conversion/encode per captured frame, shared by all viewers.
+        with jpeg_lock:
+            with frame_lock:
+                seq = frame_seq
                 frame = (latest_overlay if (settings["tracking"] and latest_overlay is not None)
                          else latest_frame)
-                if frame is not None:
-                    frame = frame.copy()
-                last_seq = frame_seq
-        if frame is None:
-            time.sleep(0.005)
-            continue
-
-        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        ok, buf = cv2.imencode(".jpg", bgr, encode_params)
-        if not ok:
-            continue
-        yield (b"--frame\r\nContent-Type:image/jpeg\r\n\r\n"
-               + buf.tobytes() + b"\r\n")
+            if frame is None:
+                continue
+            if jpeg_seq != seq:
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                ok, buf = cv2.imencode(".jpg", bgr, encode_params)
+                if not ok:
+                    continue
+                latest_jpeg = buf.tobytes()
+                jpeg_seq = seq
+            data = latest_jpeg
+            last_seq = seq
+        yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n" + data + b"\r\n"
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +818,7 @@ def dispatch_action(action):
     global last_manual_command
     with state_lock:
         if action in control:
+            settings["follow_me"] = False
             last_manual_command = time.monotonic()
             control[action] = True
         elif action.startswith("release_"):
@@ -814,25 +876,23 @@ def act_drive(direction: str, duration_ms: int = 600):
     if direction == "stop":
         stop_all(); return
     drive_cancel.clear()
-    with motor_lock:
+    with state_lock:
+        settings["follow_me"] = False
+    with state_lock, motor_lock:
         turn = 0
         if direction == "left":
             turn = -turn_angle
         elif direction == "right":
             turn = turn_angle
-        px.set_dir_servo_angle(turn)
-        if direction == "backward":
-            px.backward(sp)
-        else:
-            px.forward(sp)
+        guarded_drive("backward" if direction == "backward" else "forward", sp, turn)
     deadline = time.monotonic() + duration_ms / 1000.0
     while time.monotonic() < deadline and not drive_cancel.is_set():
         if safety_blocks(direction):
             drive_cancel.set()
             break
         time.sleep(0.05)
+    guarded_drive("stop")
     with motor_lock:
-        px.stop()
         px.set_dir_servo_angle(0)
 
 
@@ -877,7 +937,7 @@ def act_set_follow_me(enabled: bool):
         settings["follow_me"] = bool(enabled)
         settings["tracking"] = bool(enabled) or settings["tracking"]
         if not enabled:
-            px.stop()
+            guarded_drive("stop")
 
 
 def act_dance():
@@ -1342,6 +1402,7 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
   📏 <span id="distVal" class="value">--</span> cm
   &nbsp;·&nbsp; 🌗 <span id="gsVal" class="value">--</span>
   &nbsp;·&nbsp; <span id="safetyBadge" style="cursor:pointer;padding:2px 8px;border-radius:8px;background:#1b5e20;font-size:11px;">SAFETY ON</span>
+  <div id="sensorError" style="color:#ffb74d;margin-top:6px;" role="status"></div>
 </p>
 
 <div class="remote">
@@ -1439,6 +1500,7 @@ let volumeUserDragging = false;
 function applyState(s){
   if (!s) return;
   if (s.settings) {
+    document.getElementById("sensorError").innerText = s.settings.sensor_error || "";
     document.getElementById("faceStatus").innerText = s.settings.last_face || "---";
     document.getElementById("recognizedStatus").innerText = s.settings.recognized_face || "---";
     if (typeof s.settings.face_threshold === "number") {
@@ -1750,9 +1812,17 @@ document.getElementById("updateBtn").addEventListener("click", async () => {
   }
 });
 
-function press(action){ wsSend({type:"cmd", action: action}); }
-function release(action){ wsSend({type:"cmd", action: "release_" + action}); }
-function once(action){ wsSend({type:"cmd", action: action}); }
+function press(action){ held[action] = true; wsSend({type:"cmd", action: action}); }
+function release(action){ held[action] = false; wsSend({type:"cmd", action: "release_" + action}); }
+function once(action){
+  if (action === "stop") Object.keys(held).forEach(k => held[k] = false);
+  wsSend({type:"cmd", action: action});
+}
+function releaseAll(){
+  Object.keys(held).forEach(k => { if (held[k]) release(k); });
+}
+window.addEventListener("blur", releaseAll);
+document.addEventListener("visibilitychange", () => { if (document.hidden) releaseAll(); });
 
 document.querySelectorAll("button[data-cmd]").forEach(b => {
   const action = b.dataset.cmd;
@@ -1774,13 +1844,14 @@ const keyMap = {ArrowUp:"forward", ArrowDown:"backward", ArrowLeft:"left", Arrow
                 w:"forward", s:"backward", a:"left", d:"right"};
 const held = {};
 window.addEventListener("keydown", e => {
+  if (e.target.matches("input,textarea,select,[contenteditable]")) return;
+  if (e.code === "Space") { e.preventDefault(); once("stop"); return; }
   const k = keyMap[e.key]; if (!k || held[k]) return;
   held[k] = true; press(k);
 });
 window.addEventListener("keyup", e => {
   const k = keyMap[e.key]; if (!k) return;
   held[k] = false; release(k);
-  if (e.key === " ") once("stop");
 });
 
 connect();
@@ -1827,6 +1898,8 @@ def status():
 def tracking_route():
     with state_lock:
         settings["tracking"] = request.form.get("tracking") == "true"
+        if not settings["tracking"]:
+            stop_all()
     return "ok"
 
 
@@ -1930,11 +2003,10 @@ def update_route():
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             return jsonify({"state": "idle", "message": "Aucune mise à jour exécutée"})
     try:
-        subprocess.Popen(
-            ["/usr/local/sbin/picar-update"],
-            start_new_session=True,
-            close_fds=True,
-        )
+        # A separate systemd unit survives the controller's restart.
+        if not pathlib.Path("/etc/systemd/system/picar-update.path").exists():
+            raise FileNotFoundError("update path unit not installed")
+        UPDATE_REQUEST.write_text(uuid.uuid4().hex + "\n")
     except OSError:
         return jsonify({
             "ok": False,
@@ -2151,6 +2223,8 @@ def ws_endpoint(ws):
             elif mtype == "tracking":
                 with state_lock:
                     settings["tracking"] = bool(msg.get("value"))
+                    if not settings["tracking"]:
+                        stop_all()
             elif mtype == "follow_me":
                 act_set_follow_me(bool(msg.get("value")))
             elif mtype == "safety":
@@ -2187,6 +2261,10 @@ def ws_endpoint(ws):
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    def shutdown(signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
     try:
         stop_all()
         camera_center()

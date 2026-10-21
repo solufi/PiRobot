@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for PiCar-X update requests
+
+[Path]
+PathChanged=/home/solufi/update-request
+Unit=picar-update.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=PiCar-X application update
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=solufi
+WorkingDirectory=/home/solufi
+EnvironmentFile=-/etc/picar-update.env
+ExecStart=/usr/local/sbin/picar-update
+TimeoutStartSec=240
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/solufi
+PrivateTmp=true
