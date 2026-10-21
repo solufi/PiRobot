@@ -30,7 +30,7 @@ que le service est `active` et que `/healthz` répond.
 Il installe aussi Avahi et configure `robot.local` par défaut; pour un autre nom:
 `PICAR_MDNS_NAME=jamal ./scripts/deploy.sh user@host`. Les clients doivent être sur le même
 réseau et autoriser mDNS; sinon utiliser l'adresse IP.
-Après ce premier déploiement, le bouton **METTRE À JOUR** sur l’écran principal télécharge la
+Après ce premier déploiement, le bouton **METTRE À JOUR** dans **Paramètres** télécharge la
 branche `main` depuis GitHub, vérifie la syntaxe, remplace uniquement les fichiers applicatifs
 et redémarre automatiquement le service. En cas d’échec du healthcheck, la version précédente
 est restaurée; les modèles, profils et `/etc/picar.env` ne sont pas modifiés.
@@ -63,6 +63,7 @@ de calcul. Sur le Pi 4 mesuré, YuNet prenait environ 35 ms à 320×240; cela ne
 remplace pas une validation du suivi et des arrêts sur le robot en conditions réelles.
 
 Tests sans matériel : `python3 -m unittest discover -s tests -v`.
+Tests de reconnexion de l’interface (Node.js) : `node tests/test_video_ui.cjs`.
 
 ## Configuration runtime
 
@@ -124,3 +125,19 @@ ssh solufi@192.168.2.181 'systemctl status picar.service --no-pager -l'
 ssh solufi@192.168.2.181 'journalctl -u picar.service -n 50 --no-pager'
 curl -s http://192.168.2.181:5000/healthz
 ```
+
+## Résolution et reconnexion vidéo
+
+Dans **Paramètres**, choisir 640×480 (20 images/s), HD 1280×720
+(15 images/s), ou Full HD 1920×1080 (10 images/s), puis **APPLIQUER LA
+RÉSOLUTION**. Le réglage est enregistré dans
+`/home/solufi/models/video_settings.json` (surcharge par `PICAR_VIDEO_SETTINGS`).
+Le contrôleur arrête les moteurs puis redémarre pour appliquer le mode.
+Si le mode HD échoue au démarrage, il revient à 640×480 et l’indique dans l’interface.
+
+La détection travaille toujours sur une petite image qui conserve les proportions.
+Les erreurs de position et la taille de cible sont ramenées à l’échelle de référence
+pour conserver les seuils du suivi quand la résolution change. Le navigateur
+rouvre le flux MJPEG lorsque la connexion aux commandes revient et réessaie après
+une erreur de chargement vidéo. Les modes HD augmentent le débit réseau et la charge
+d’encodage; ils restent à vérifier sur le robot après installation.
