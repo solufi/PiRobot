@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import tempfile
+import logging
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -52,6 +53,10 @@ class RuntimeTests(unittest.TestCase):
         self.c.video_restart_pending = False
         self.c.settings.update(video_resolution="640x480", video_error="")
         self.c.CAM_SIZE = (640, 480)
+        self.c.latest_frame = None
+        self.c.frame_seq = 0
+        self.c.jpeg_seq = -1
+        self.c.latest_jpeg = None
 
     def test_stop_prevents_inflight_tracker_from_restarting_motors(self):
         self.c.stop_all()
@@ -163,6 +168,59 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.c.cv2.imencode.call_count, 2)
         first.close()
         second.close()
+
+    def test_camera_settings_drive_both_servos_and_stop_follow(self):
+        self.c.apply_camera_settings(12, -12)
+        self.c.px.set_cam_pan_angle.assert_called_once_with(12)
+        self.c.px.set_cam_tilt_angle.assert_called_once_with(-12)
+        self.assertFalse(self.c.settings["tracking"])
+        self.assertFalse(self.c.settings["follow_me"])
+
+    def test_camera_adjustment_preserves_manual_driving(self):
+        self.c.settings.update(tracking=False, follow_me=False)
+        self.c.control["forward"] = True
+        self.c.apply_camera_settings(5, None)
+        self.assertTrue(self.c.control["forward"])
+        self.c.px.stop.assert_not_called()
+
+    def test_snapshot_and_mjpeg_share_jpeg_cache(self):
+        self.c.cv2.imencode.reset_mock()
+        buffer = MagicMock()
+        buffer.tobytes.return_value = b"jpeg"
+        self.c.cv2.imencode.return_value = True, buffer
+        self.c.latest_frame = object()
+        self.c.frame_seq = 4
+        data, seq = self.c.encoded_video_frame()
+        self.assertEqual((data, seq), (b"jpeg", 4))
+        stream = self.c.mjpeg_gen()
+        self.assertIn(data, next(stream))
+        stream.close()
+        self.c.cv2.imencode.assert_called_once()
+
+    def test_stale_video_frame_is_not_served_as_live(self):
+        self.c.latest_frame = object()
+        self.c.last_frame_at = time.monotonic() - 3
+        self.assertIsNone(self.c.encoded_video_frame()[0])
+
+    def test_many_finite_frame_requests_keep_receiving_new_images(self):
+        buffer = MagicMock()
+        buffer.tobytes.return_value = b"jpeg"
+        self.c.cv2.imencode.return_value = True, buffer
+        self.c.latest_frame = object()
+        with patch.object(self.c, "Response", side_effect=lambda data, **kw: (data, kw)):
+            for seq in range(1, 51):
+                self.c.frame_seq = seq
+                data, options = self.c.video_frame()
+                self.assertEqual(data, b"jpeg")
+                self.assertEqual(options["headers"]["X-Frame-Sequence"], str(seq))
+                self.assertEqual(options["mimetype"], "image/jpeg")
+
+    def test_video_access_filter_keeps_failures(self):
+        access_filter = self.c.VideoAccessFilter()
+        def record(text):
+            return logging.LogRecord("werkzeug", logging.INFO, "", 0, text, (), None)
+        self.assertFalse(access_filter.filter(record('"GET /video_frame?t=1 HTTP/1.1" 200 -')))
+        self.assertTrue(access_filter.filter(record('"GET /video_frame?t=1 HTTP/1.1" 503 -')))
 
     def test_tracking_geometry_is_stable_across_resolutions(self):
         for size in ((640, 480), (1280, 720), (1920, 1080)):

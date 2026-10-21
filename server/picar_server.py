@@ -31,6 +31,16 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("picar")
 
+
+class VideoAccessFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        return not ("/video_frame" in message and '" 200 ' in message)
+
+
+# Snapshot video can request 20 images/s; retain access errors without flooding SD logs.
+logging.getLogger("werkzeug").addFilter(VideoAccessFilter())
+
 app = Flask(__name__)
 sock = Sock(app)
 app.config["MAX_CONTENT_LENGTH"] = int(
@@ -854,9 +864,30 @@ def _request_is_authorized():
 # ---------------------------------------------------------------------------
 # MJPEG stream
 # ---------------------------------------------------------------------------
-def mjpeg_gen():
+def encoded_video_frame():
+    """Encode one fresh frame once, shared by snapshot and MJPEG clients."""
     global jpeg_seq, latest_jpeg
-    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    with jpeg_lock:
+        with frame_lock:
+            seq = frame_seq
+            frame = (latest_overlay if (settings["tracking"] and latest_overlay is not None)
+                     else latest_frame)
+            age = time.monotonic() - last_frame_at
+        if frame is None or age > 2.0:
+            return None, seq
+        if jpeg_seq != seq:
+            bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            ok, buf = cv2.imencode(
+                ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+            )
+            if not ok:
+                return None, seq
+            latest_jpeg = buf.tobytes()
+            jpeg_seq = seq
+        return latest_jpeg, seq
+
+
+def mjpeg_gen():
     last_seq = -1
     while True:
         with frame_condition:
@@ -866,25 +897,9 @@ def mjpeg_gen():
             )
             if latest_frame is None or frame_seq == last_seq:
                 continue
-        # One conversion/encode per captured frame, shared by all viewers.
-        with jpeg_lock:
-            with frame_lock:
-                seq = frame_seq
-                frame = (latest_overlay if (settings["tracking"] and latest_overlay is not None)
-                         else latest_frame)
-            if frame is None:
-                continue
-            last_seq = seq
-            if jpeg_seq != seq:
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                ok, buf = cv2.imencode(".jpg", bgr, encode_params)
-                if not ok:
-                    continue
-                latest_jpeg = buf.tobytes()
-                jpeg_seq = seq
-            data = latest_jpeg
-            last_seq = seq
-        yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n" + data + b"\r\n"
+        data, last_seq = encoded_video_frame()
+        if data is not None:
+            yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n" + data + b"\r\n"
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +944,10 @@ def apply_settings(speed=None, turn=None):
 
 def apply_camera_settings(pan=None, tilt=None):
     with state_lock:
+        # Manual camera control must not fight the face tracker.
+        if settings["follow_me"]:
+            stop_all()
+        settings["tracking"] = False
         if pan is not None:
             settings["cam_pan"] = clamp(int(pan), -60, 60)
         if tilt is not None:
@@ -1460,7 +1479,7 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
 <h2>PiCar-X</h2>
 
 <div class="camera-box">
-  <img id="videoStream" src="/video_feed" alt="camera">
+  <img id="videoStream" src="/video_frame" alt="camera">
   <button class="fs-btn" id="fsBtn" title="Plein écran" onclick="toggleFullscreen()">⛶</button>
 </div>
 
@@ -1557,20 +1576,32 @@ body.fullscreen .remote .stop{background:rgba(176,0,32,0.85);}
 const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
 let ws = null, wsReady = false, reconnectDelay = 500;
 const wsBadge = document.getElementById("wsStatus");
-let videoRetryTimer = null;
+let videoRetryTimer = null, videoFrameDelay = 50, videoRequestId = 0;
 function reconnectVideo(){
   clearTimeout(videoRetryTimer);
-  document.getElementById("videoStream").src = "/video_feed?t=" + Date.now();
+  if (document.hidden) return;
+  // A finite JPEG response leaves HTTP connections free for chat and controls.
+  document.getElementById("videoStream").src = "/video_frame?t=" + Date.now() + "&n=" + (++videoRequestId);
+  videoRetryTimer = setTimeout(reconnectVideo, 5000);
 }
+document.getElementById("videoStream").addEventListener("load", () => {
+  clearTimeout(videoRetryTimer);
+  if (!document.hidden) videoRetryTimer = setTimeout(reconnectVideo, videoFrameDelay);
+});
 document.getElementById("videoStream").addEventListener("error", () => {
   clearTimeout(videoRetryTimer);
   videoRetryTimer = setTimeout(reconnectVideo, 1500);
+});
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(videoRetryTimer);
+  if (!document.hidden) reconnectVideo();
 });
 async function refreshVideoSettings(){
   try {
     const response = await fetchWithTimeout("/video_settings", {cache:"no-store"});
     if (!response.ok) return;
     const data = await response.json();
+    videoFrameDelay = 1000 / Math.max(1, Math.min(20, data.fps || 20));
     document.getElementById("videoResolution").value = data.resolution;
     document.getElementById("videoStatus").innerText = data.error || "";
   } catch(e) {}
@@ -1599,13 +1630,21 @@ function connect(){
   };
 }
 function wsSend(obj){
-  if (wsReady) { ws.send(JSON.stringify(obj)); return true; }
-  // Fallback HTTP
-  if (obj.type === "cmd") {
-    fetch("/cmd", {method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:"action="+obj.action});
+  if (wsReady) {
+    try { ws.send(JSON.stringify(obj)); return true; }
+    catch(e) { wsReady = false; }
+  }
+  const routes = {cmd:"/cmd", settings:"/settings", camera:"/camera_settings"};
+  if (routes[obj.type]) {
+    const fields = Object.entries(obj).filter(([key,value]) => key !== "type" && value != null);
+    fetchWithTimeout(routes[obj.type], {
+      method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:new URLSearchParams(fields).toString()
+    }).catch(() => {});
   }
   return false;
 }
+
 setInterval(() => {
   if (wsReady && Object.values(held).some(Boolean)) wsSend({type:"heartbeat"});
 }, 400);
@@ -1818,20 +1857,25 @@ document.getElementById("micBrowser").addEventListener("click", async () => {
   } catch(e) { appendChat("robot", "⚠️ " + e.message); }
 });
 
-function bindRange(id, key){
+function bindRange(id, key, type="settings"){
   const el = document.getElementById(id);
   const label = document.getElementById(id+"Value");
+  let pending = null;
   el.addEventListener("input", () => {
     label.innerText = el.value;
-    const msg = {type:"settings"};
-    msg[key] = parseInt(el.value, 10);
-    wsSend(msg);
+    if (pending !== null) return;
+    pending = setTimeout(() => {
+      pending = null;
+      const msg = {type:type};
+      msg[key] = parseInt(el.value, 10);
+      wsSend(msg);
+    }, 60);
   });
 }
 bindRange("speed","speed");
 bindRange("turn","turn");
-bindRange("pan","pan");
-bindRange("tilt","tilt");
+bindRange("pan","pan","camera");
+bindRange("tilt","tilt","camera");
 
 // Volume slider (separate WS message type, debounced)
 (function(){
@@ -2064,7 +2108,21 @@ def healthz():
 @app.route("/")
 @requires_auth
 def index():
-    return render_template_string(HTML)
+    return Response(render_template_string(HTML), mimetype="text/html",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.route("/video_frame")
+@requires_auth
+def video_frame():
+    data, seq = encoded_video_frame()
+    if data is None:
+        return Response("Vidéo temporairement indisponible", 503,
+                        headers={"Cache-Control": "no-store", "Retry-After": "1"})
+    return Response(data, mimetype="image/jpeg", headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "X-Frame-Sequence": str(seq),
+    })
 
 
 @app.route("/video_feed")
